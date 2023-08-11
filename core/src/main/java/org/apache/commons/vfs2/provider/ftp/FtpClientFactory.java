@@ -121,19 +121,31 @@ public final class FtpClientFactory
             password = "anonymous".toCharArray();
         }
 
-        Integer lTimeout = null;
-        try{
-        	lTimeout = Integer.parseInt(timeout);
-        }catch(NumberFormatException nfe){
-        	lTimeout = 5000;
+        Integer lTimeout;
+
+        if (timeout == null) {
+            lTimeout = FtpFileSystemConfigBuilder.getInstance().getConnectTimeout(fileSystemOptions);
+        } else {
+            try {
+                lTimeout = Integer.parseInt(timeout);
+            } catch (NumberFormatException nfe) {
+                log.warn("Invalid connection timeout " + timeout + ". Set the lTimeout as 5000. (default)");
+                lTimeout = 5000;
+            }
         }
-        
-        Integer iRetryCount = null;
-        try{
-        	iRetryCount = Integer.parseInt(retryCount);
-        }catch(NumberFormatException nfe){
-        	iRetryCount = 5;
-        }           
+
+        Integer iRetryCount;
+        if (retryCount == null) {
+            iRetryCount = FtpFileSystemConfigBuilder.getInstance().getRetryCount(fileSystemOptions);
+        } else {
+            try {
+                iRetryCount = Integer.parseInt(retryCount);
+            } catch (NumberFormatException nfe) {
+                log.warn("Invalid connection retry count " + retryCount + ". Set the connectionRetryCount as 5. "
+                        + "(default)");
+                iRetryCount = 5;
+            }
+        }
         
         boolean proxyMode = false;
         

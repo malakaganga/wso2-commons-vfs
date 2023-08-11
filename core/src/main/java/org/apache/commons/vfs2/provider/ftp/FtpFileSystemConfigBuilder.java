@@ -32,6 +32,8 @@ public final class FtpFileSystemConfigBuilder extends FileSystemConfigBuilder
     private static final FtpFileSystemConfigBuilder BUILDER = new FtpFileSystemConfigBuilder();
 
     private static final String FACTORY_KEY = FTPFileEntryParserFactory.class.getName() + ".KEY";
+    private static final String CONNECT_TIMEOUT = FTPFileEntryParserFactory.class.getName() + ".CONNECT_TIMEOUT";
+    private static final String RETRY_COUNT = FtpFileSystemConfigBuilder.class.getName() + ".RETRY_COUNT";
     private static final String PASSIVE_MODE = FtpFileSystemConfigBuilder.class.getName() + ".PASSIVE";
     private static final String USER_DIR_IS_ROOT = FtpFileSystemConfigBuilder.class.getName() + ".USER_DIR_IS_ROOT";
     private static final String DATA_TIMEOUT = FtpFileSystemConfigBuilder.class.getName() + ".DATA_TIMEOUT";
@@ -60,6 +62,32 @@ public final class FtpFileSystemConfigBuilder extends FileSystemConfigBuilder
     {
         return BUILDER;
     }
+
+    /**
+     * Sets the timeout for the initial control connection.
+     * <p>
+     * If you set the connectTimeout to {@code null} no connectTimeout will be set.
+     *
+     * @param opts The FileSystemOptions.
+     * @param connectTimeout the timeout value in milliseconds
+     * @since 2.1
+     */
+    public void setConnectTimeout(final FileSystemOptions opts, final Integer connectTimeout) {
+        setParam(opts, CONNECT_TIMEOUT, connectTimeout);
+    }
+
+    /**
+     * Gets the timeout in milliseconds to use for the socket connection.
+     *
+     * @param opts The FileSystemOptions.
+     * @return The timeout in milliseconds to use for the socket connection.
+     * @since 2.1
+     */
+    public Integer getConnectTimeout(final FileSystemOptions opts) {
+        return getInteger(opts, CONNECT_TIMEOUT);
+    }
+
+
 
     /**
      * FTPFileEntryParserFactory which will be used for ftp-entry parsing.
@@ -96,6 +124,30 @@ public final class FtpFileSystemConfigBuilder extends FileSystemConfigBuilder
     {
         setParam(opts, FACTORY_KEY, key);
     }
+
+    /**
+     * Gets the retry count.
+     *
+     * @param opts The FileSystemOptions.
+     * @return The retry count.
+     * @since 2.1
+     */
+    public Integer getRetryCount(final FileSystemOptions opts) {
+        return getInteger(opts, RETRY_COUNT);
+    }
+
+    /**
+     * Sets the number of retries.
+     *
+     * @param opts The FileSystemOptions.
+     * @param retryCount the retryCount value.
+     * @since 2.1
+     */
+    public void setRetryCount(final FileSystemOptions opts, final Integer retryCount) {
+        setParam(opts, RETRY_COUNT, retryCount);
+    }
+
+
 
     /**
      * @param opts The FileSystemOptions.
