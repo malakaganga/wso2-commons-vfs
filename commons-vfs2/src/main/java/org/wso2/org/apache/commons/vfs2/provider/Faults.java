@@ -46,6 +46,7 @@ import org.apache.commons.net.MalformedServerReplyException;
 import org.apache.commons.net.ftp.FTPConnectionClosedException;
 import org.apache.commons.net.io.CopyStreamException;
 import org.wso2.org.apache.commons.vfs2.FileSystemException;
+import org.wso2.org.apache.commons.vfs2.util.StalledTransferException;
 
 import com.hierynomus.mserref.NtStatus;
 import com.hierynomus.mssmb2.SMBApiException;
@@ -153,7 +154,7 @@ public final class Faults {
         if (isSmbRuntime(error)) {
             return SmbRules.of(error);
         }
-        if (isGenericTransport(error)) {
+        if (isGenericTransport(error) || error instanceof StalledTransferException) {
             return Fault.TRANSPORT;
         }
         return localRow(error);

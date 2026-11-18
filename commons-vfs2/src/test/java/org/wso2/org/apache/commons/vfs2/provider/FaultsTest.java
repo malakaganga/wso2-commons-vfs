@@ -65,6 +65,7 @@ import org.apache.commons.net.io.CopyStreamException;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.wso2.org.apache.commons.vfs2.FileSystemException;
+import org.wso2.org.apache.commons.vfs2.util.StalledTransferException;
 
 import com.hierynomus.mserref.NtStatus;
 import com.hierynomus.msdfsc.DFSException;
@@ -593,5 +594,23 @@ public class FaultsTest {
                     .getConstructor(String.class).newInstance("Unknown tag");
             assertEquals("APPLICATION", String.valueOf(of.invoke(null, parse)));
         }
+    }
+
+    @Test
+    public void stalledTransferExceptionIsTransport() {
+        final StalledTransferException stalled = new StalledTransferException("A write moved no bytes", 61000, 5,
+                null);
+        assertEquals(Fault.TRANSPORT, Faults.of(stalled));
+        assertTrue(Faults.isTransport(stalled));
+        assertEquals(Fault.TRANSPORT,
+                Faults.of(new FileSystemException("vfs.provider/get-type.error", stalled, "/in/a.xml")));
+    }
+
+    @Test
+    public void stalledTransferInsideTheFtpCopyExceptionIsTransport() {
+        final CopyStreamException copy = new CopyStreamException("IOException caught while copying.", 5,
+                new StalledTransferException("A write moved no bytes", 61000, 5, null));
+        assertEquals(Fault.TRANSPORT, Faults.of(copy));
+        assertTrue(Faults.isTransport(new FileSystemException("vfs.provider/get-type.error", copy, "/in/a.xml")));
     }
 }
