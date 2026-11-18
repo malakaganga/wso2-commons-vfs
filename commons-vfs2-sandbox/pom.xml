@@ -68,11 +68,9 @@
       <optional>true</optional>
     </dependency>
 
-    <!-- Not managed in parent; keep explicit version -->
     <dependency>
       <groupId>com.hierynomus</groupId>
       <artifactId>smbj</artifactId>
-      <version>0.13.0</version>
       <optional>true</optional>
     </dependency>
 
