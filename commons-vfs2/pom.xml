@@ -77,23 +77,23 @@
       <artifactId>jsch</artifactId>
       <optional>true</optional>
     </dependency>
-    <!-- Tests -->
-    <dependency>
-      <groupId>org.apache.logging.log4j</groupId>
-      <artifactId>log4j-slf4j2-impl</artifactId>
-      <scope>test</scope>
-    </dependency>
-    <!-- LibraryCallsTest checks the smbj calls of the sandbox too. -->
+    <!-- Faults reads the exceptions of smbj. LibraryCallsTest checks the smbj calls of the sandbox too. -->
     <dependency>
       <groupId>com.hierynomus</groupId>
       <artifactId>smbj</artifactId>
-      <scope>test</scope>
+      <optional>true</optional>
       <exclusions>
         <exclusion>
           <groupId>org.bouncycastle</groupId>
           <artifactId>bcprov-jdk18on</artifactId>
         </exclusion>
       </exclusions>
+    </dependency>
+    <!-- Tests -->
+    <dependency>
+      <groupId>org.apache.logging.log4j</groupId>
+      <artifactId>log4j-slf4j2-impl</artifactId>
+      <scope>test</scope>
     </dependency>
     <dependency>
       <groupId>org.junit.jupiter</groupId>
