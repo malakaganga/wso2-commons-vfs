@@ -16,17 +16,18 @@
  */
 package org.wso2.org.apache.commons.vfs2.provider.ftp;
 
+import java.io.FilterInputStream;
+import java.io.FilterOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.time.Instant;
+import java.util.Arrays;
 import java.util.Calendar;
-import java.util.Collections;
 import java.util.List;
-import java.util.Map;
 import java.util.Objects;
 import java.util.TimeZone;
-import java.util.TreeMap;
+import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 
@@ -34,6 +35,7 @@ import org.apache.commons.lang3.ArrayUtils;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.commons.net.ftp.FTPFile;
+import org.apache.commons.net.ftp.FTPReply;
 import org.wso2.org.apache.commons.vfs2.FileName;
 import org.wso2.org.apache.commons.vfs2.FileNotFolderException;
 import org.wso2.org.apache.commons.vfs2.FileNotFoundException;
@@ -43,6 +45,7 @@ import org.wso2.org.apache.commons.vfs2.FileType;
 import org.wso2.org.apache.commons.vfs2.RandomAccessContent;
 import org.wso2.org.apache.commons.vfs2.provider.AbstractFileName;
 import org.wso2.org.apache.commons.vfs2.provider.AbstractFileObject;
+import org.wso2.org.apache.commons.vfs2.provider.Fault;
 import org.wso2.org.apache.commons.vfs2.provider.UriParser;
 import org.wso2.org.apache.commons.vfs2.util.FileObjectUtils;
 import org.wso2.org.apache.commons.vfs2.util.Messages;
@@ -60,15 +63,26 @@ public class FtpFileObject extends AbstractFileObject<FtpFileSystem> {
      */
     final class FtpInputStream extends MonitorInputStream {
         private final FtpClient client;
+        private final NotingInputStream data;
 
         FtpInputStream(final FtpClient client, final InputStream in) {
-            super(in);
+            this(client, new NotingInputStream(in));
+        }
+
+        private FtpInputStream(final FtpClient client, final NotingInputStream data) {
+            super(data);
             this.client = client;
+            this.data = data;
         }
 
         FtpInputStream(final FtpClient client, final InputStream in, final int bufferSize) {
-            super(in, bufferSize);
+            this(client, new NotingInputStream(in), bufferSize);
+        }
+
+        private FtpInputStream(final FtpClient client, final NotingInputStream data, final int bufferSize) {
+            super(data, bufferSize);
             this.client = client;
+            this.data = data;
         }
 
         void abort() throws IOException {
@@ -84,20 +98,23 @@ public class FtpFileObject extends AbstractFileObject<FtpFileSystem> {
         }
 
         /**
-         * Called after the stream has been closed.
+         * Called after the stream has been closed. Only a good completion gives the client back.
          */
         @Override
         protected void onClose() throws IOException {
-            final boolean ok;
-            try {
-                ok = client.completePendingCommand() || isTransferAbortedOkReplyCode();
-            } finally {
-                getAbstractFileSystem().putClient(client);
+            if (data.failure() != null) {
+                // The data stream failed, so the final reply is not read. The client is not in step any more.
+                getAbstractFileSystem().discardClient(client);
+                return;
             }
-
-            if (!ok) {
-                throw new FileSystemException("vfs.provider.ftp/finish-get.error", getName());
+            final FileSystemException refused = run(client, c -> c.completePendingCommand()
+                    || isTransferAbortedOkReplyCode() ? null
+                    : refusal(c, "vfs.provider.ftp/finish-get-reply.error", true, getName()));
+            if (refused != null) {
+                getAbstractFileSystem().discardClient(client);
+                throw refused;
             }
+            getAbstractFileSystem().putClient(client);
         }
     }
     /**
@@ -105,33 +122,175 @@ public class FtpFileObject extends AbstractFileObject<FtpFileSystem> {
      */
     private final class FtpOutputStream extends MonitorOutputStream {
         private final FtpClient client;
+        private final NotingOutputStream data;
 
         FtpOutputStream(final FtpClient client, final OutputStream outstr) {
-            super(outstr);
+            this(client, new NotingOutputStream(outstr));
+        }
+
+        private FtpOutputStream(final FtpClient client, final NotingOutputStream data) {
+            super(data);
             this.client = client;
+            this.data = data;
         }
 
         /**
-         * Called after this stream is closed.
+         * Called after this stream is closed. Only a good completion gives the client back.
          */
         @Override
         protected void onClose() throws IOException {
-            final boolean ok;
-            try {
-                ok = client.completePendingCommand();
-            } finally {
-                getAbstractFileSystem().putClient(client);
+            if (data.failure() != null) {
+                // The data stream failed, so the final reply is not read. The client is not in step any more.
+                getAbstractFileSystem().discardClient(client);
+                return;
             }
+            final FileSystemException refused = run(client, c -> c.completePendingCommand() ? null
+                    : refusal(c, "vfs.provider.ftp/finish-put-reply.error", false, getName()));
+            if (refused != null) {
+                getAbstractFileSystem().discardClient(client);
+                throw refused;
+            }
+            getAbstractFileSystem().putClient(client);
+        }
+    }
 
-            if (!ok) {
-                throw new FileSystemException("vfs.provider.ftp/finish-put.error", getName());
+    /**
+     * Keeps the first exception of the data stream of a read.
+     */
+    private static final class NotingInputStream extends FilterInputStream {
+
+        private volatile IOException failure;
+
+        NotingInputStream(final InputStream in) {
+            super(in);
+        }
+
+        IOException failure() {
+            return failure;
+        }
+
+        private IOException note(final IOException e) {
+            if (failure == null) {
+                failure = e;
+            }
+            return e;
+        }
+
+        @Override
+        public int read() throws IOException {
+            try {
+                return in.read();
+            } catch (final IOException e) {
+                throw note(e);
+            }
+        }
+
+        @Override
+        public int read(final byte[] b, final int off, final int len) throws IOException {
+            try {
+                return in.read(b, off, len);
+            } catch (final IOException e) {
+                throw note(e);
+            }
+        }
+
+        @Override
+        public long skip(final long n) throws IOException {
+            try {
+                return in.skip(n);
+            } catch (final IOException e) {
+                throw note(e);
+            }
+        }
+
+        @Override
+        public int available() throws IOException {
+            try {
+                return in.available();
+            } catch (final IOException e) {
+                throw note(e);
+            }
+        }
+
+        @Override
+        public void close() throws IOException {
+            try {
+                in.close();
+            } catch (final IOException e) {
+                throw note(e);
             }
         }
     }
 
+    /**
+     * Keeps the first exception of the data stream of a write.
+     */
+    private static final class NotingOutputStream extends FilterOutputStream {
+
+        private volatile IOException failure;
+
+        NotingOutputStream(final OutputStream out) {
+            super(out);
+        }
+
+        IOException failure() {
+            return failure;
+        }
+
+        private IOException note(final IOException e) {
+            if (failure == null) {
+                failure = e;
+            }
+            return e;
+        }
+
+        @Override
+        public void write(final int b) throws IOException {
+            try {
+                out.write(b);
+            } catch (final IOException e) {
+                throw note(e);
+            }
+        }
+
+        @Override
+        public void write(final byte[] b, final int off, final int len) throws IOException {
+            try {
+                out.write(b, off, len);
+            } catch (final IOException e) {
+                throw note(e);
+            }
+        }
+
+        @Override
+        public void flush() throws IOException {
+            try {
+                out.flush();
+            } catch (final IOException e) {
+                throw note(e);
+            }
+        }
+
+        @Override
+        public void close() throws IOException {
+            try {
+                out.close();
+            } catch (final IOException e) {
+                throw note(e);
+            }
+        }
+    }
+
+    /**
+     * One call on a client that this object took.
+     *
+     * @param <T> the result.
+     */
+    private interface FtpCall<T> {
+        T run(FtpClient client) throws IOException;
+    }
+
     private static final long DEFAULT_TIMESTAMP = 0L;
-    private static final Map<String, FTPFile> EMPTY_FTP_FILE_MAP = Collections
-            .unmodifiableMap(new TreeMap<>());
 
     private static final FTPFile UNKNOWN = new FTPFile();
 
@@ -140,7 +299,8 @@ public class FtpFileObject extends AbstractFileObject<FtpFileSystem> {
     private final String relPath;
     // Cached info
     private volatile FTPFile ftpFile;
-    private volatile Map<String, FTPFile> childMap;
+    // Created once and never null. Empty means that the folder was not listed yet, or that it has no entry.
+    private final ConcurrentSkipListMap<String, FTPFile> childMap = new ConcurrentSkipListMap<>();
 
     private volatile FileObject linkDestination;
 
@@ -183,16 +343,12 @@ public class FtpFileObject extends AbstractFileObject<FtpFileSystem> {
      */
     @Override
     protected void doCreateFolder() throws Exception {
-        final boolean ok;
         final FtpClient client = getAbstractFileSystem().getClient();
-        try {
-            ok = client.makeDirectory(relPath);
-        } finally {
-            getAbstractFileSystem().putClient(client);
-        }
-
-        if (!ok) {
-            throw new FileSystemException("vfs.provider.ftp/create-folder.error", getName());
+        final FileSystemException refused = run(client, c -> c.makeDirectory(relPath) ? null
+                : refusal(c, "vfs.provider.ftp/create-folder-reply.error", false, getName()));
+        giveBack(client, refused);
+        if (refused != null) {
+            throw refused;
         }
     }
 
@@ -202,26 +358,48 @@ public class FtpFileObject extends AbstractFileObject<FtpFileSystem> {
     @Override
     protected void doDelete() throws Exception {
         synchronized (getFileSystem()) {
-            if (ftpFile != null) {
-                final boolean ok;
-                final FtpClient ftpClient = getAbstractFileSystem().getClient();
-                try {
-                    if (ftpFile.isDirectory()) {
-                        ok = ftpClient.removeDirectory(relPath);
-                    } else {
-                        ok = ftpClient.deleteFile(relPath);
-                    }
-                } finally {
-                    getAbstractFileSystem().putClient(ftpClient);
-                }
-
-                if (!ok) {
-                    throw new FileSystemException("vfs.provider.ftp/delete-file.error", getName());
-                }
-                ftpFile = null;
+            final FtpClient ftpClient = getAbstractFileSystem().getClient();
+            FTPFile entry = ftpFile;
+            if (entry == null || entry == UNKNOWN) {
+                // A listing on another thread can clear the info of this entry after the delete chose it. Then the
+                // entry is looked up again here, under the same lock, before any command is sent.
+                entry = lookUpForDelete(ftpClient);
             }
-            childMap = EMPTY_FTP_FILE_MAP;
+            final boolean folder = entry.isDirectory();
+            final FileSystemException refused = run(ftpClient,
+                    c -> (folder ? c.removeDirectory(relPath) : c.deleteFile(relPath)) ? null
+                            : refusal(c, "vfs.provider.ftp/delete-file-reply.error", false, getName()));
+            giveBack(ftpClient, refused);
+            if (refused != null) {
+                throw refused;
+            }
+            ftpFile = null;
+            childMap.clear();
         }
+    }
+
+    // The entry of this file in a new listing of its folder. A link is the entry itself, so it gets DELE. A listing
+    // that is refused, or that does not show the name, can not prove that the delete is done, so it is an error.
+    // The client goes back or is discarded by the fault of that error.
+    private FTPFile lookUpForDelete(final FtpClient client) throws IOException {
+        final String name = UriParser.decode(getName().getBaseName());
+        final String folderPath = UriParser.decode(getAbstractFileSystem().getRootName()
+                .getRelativeName(getName().getParent()));
+        final FTPFile[] entries = run(client, c -> c.listFiles(".".equals(folderPath) ? null : folderPath));
+        final FileSystemException error;
+        if (entries == null) {
+            error = run(client, c -> refusal(c, "vfs.provider.ftp/delete-lookup-reply.error", true, getName()));
+        } else {
+            for (final FTPFile entry : entries) {
+                if (entry != null && name.equals(entry.getName())) {
+                    return entry;
+                }
+            }
+            error = new FileSystemException("vfs.provider.ftp/delete-not-listed.error", getName());
+            error.setFault(Fault.MISSING);
+        }
+        giveBack(client, error);
+        throw error;
     }
 
     /**
@@ -231,7 +409,7 @@ public class FtpFileObject extends AbstractFileObject<FtpFileSystem> {
     protected void doDetach() {
         synchronized (getFileSystem()) {
             ftpFile = null;
-            childMap = null;
+            childMap.clear();
             mdtmSet = false;
         }
     }
@@ -240,39 +418,32 @@ public class FtpFileObject extends AbstractFileObject<FtpFileSystem> {
      * Fetches the children of this file, if not already cached.
      */
     private void doGetChildren() throws IOException {
-        if (childMap != null) {
+        if (!childMap.isEmpty()) {
             return;
         }
 
+        final String path = ftpFile != null && ftpFile.isSymbolicLink()
+                ? getFileSystem().getFileSystemManager().resolveName(getParent().getName(), ftpFile.getLink())
+                        .getPath()
+                : relPath;
         final FtpClient client = getAbstractFileSystem().getClient();
-        try {
-            final String path = ftpFile != null && ftpFile.isSymbolicLink()
-                    ? getFileSystem().getFileSystemManager().resolveName(getParent().getName(), ftpFile.getLink())
-                            .getPath()
-                    : relPath;
-            final FTPFile[] tmpChildren = client.listFiles(path);
-            if (ArrayUtils.isEmpty(tmpChildren)) {
-                childMap = EMPTY_FTP_FILE_MAP;
-            } else {
-                childMap = new TreeMap<>();
-
-                // Remove '.' and '..' elements
-                for (int i = 0; i < tmpChildren.length; i++) {
-                    final FTPFile child = tmpChildren[i];
-                    if (child == null) {
-                        if (log.isDebugEnabled()) {
-                            log.debug(Messages.getString("vfs.provider.ftp/invalid-directory-entry.debug",
-                                    Integer.valueOf(i), relPath));
-                        }
-                        continue;
+        final FTPFile[] tmpChildren = run(client, c -> c.listFiles(path));
+        getAbstractFileSystem().putClient(client);
+        if (!ArrayUtils.isEmpty(tmpChildren)) {
+            // Remove '.' and '..' elements
+            for (int i = 0; i < tmpChildren.length; i++) {
+                final FTPFile child = tmpChildren[i];
+                if (child == null) {
+                    if (log.isDebugEnabled()) {
+                        log.debug(Messages.getString("vfs.provider.ftp/invalid-directory-entry.debug",
+                                Integer.valueOf(i), relPath));
                     }
-                    if (!".".equals(child.getName()) && !"..".equals(child.getName())) {
-                        childMap.put(child.getName(), child);
-                    }
+                    continue;
+                }
+                if (!".".equals(child.getName()) && !"..".equals(child.getName())) {
+                    childMap.put(child.getName(), child);
                 }
             }
-        } finally {
-            getAbstractFileSystem().putClient(client);
         }
     }
 
@@ -303,17 +474,15 @@ public class FtpFileObject extends AbstractFileObject<FtpFileSystem> {
     @Override
     protected InputStream doGetInputStream(final int bufferSize) throws Exception {
         final FtpClient client = getAbstractFileSystem().getClient();
-        try {
-            final InputStream inputStream = client.retrieveFileStream(relPath, 0);
-            // VFS-210
-            if (inputStream == null) {
-                throw new FileNotFoundException(getName().toString());
-            }
-            return new FtpInputStream(client, inputStream, bufferSize);
-        } catch (final Exception e) {
-            getAbstractFileSystem().putClient(client);
-            throw e;
+        final InputStream inputStream = run(client, c -> c.retrieveFileStream(relPath, 0));
+        // VFS-210
+        if (inputStream == null) {
+            final FileSystemException refused = run(client,
+                    c -> notRead(c, getName().toString(), "vfs.provider.ftp/read-file-reply.error"));
+            giveBack(client, refused);
+            throw refused;
         }
+        return new FtpInputStream(client, inputStream, bufferSize);
     }
 
     /**
@@ -345,22 +514,15 @@ public class FtpFileObject extends AbstractFileObject<FtpFileSystem> {
     @Override
     protected OutputStream doGetOutputStream(final boolean bAppend) throws Exception {
         final FtpClient client = getAbstractFileSystem().getClient();
-        try {
-            final OutputStream out;
-            if (bAppend) {
-                out = client.appendFileStream(relPath);
-            } else {
-                out = client.storeFileStream(relPath);
-            }
-
-            FileSystemException.requireNonNull(out, "vfs.provider.ftp/output-error.debug", getName(),
-                    client.getReplyString());
-
-            return new FtpOutputStream(client, out);
-        } catch (final Exception e) {
-            getAbstractFileSystem().putClient(client);
-            throw e;
+        final OutputStream out = run(client,
+                c -> bAppend ? c.appendFileStream(relPath) : c.storeFileStream(relPath));
+        if (out == null) {
+            final FileSystemException refused = run(client,
+                    c -> refusal(c, "vfs.provider.ftp/output-error.debug", false, getName()));
+            giveBack(client, refused);
+            throw refused;
         }
+        return new FtpOutputStream(client, out);
     }
 
     @Override
@@ -413,10 +575,8 @@ public class FtpFileObject extends AbstractFileObject<FtpFileSystem> {
         // List the children of this file
         doGetChildren();
 
-        // VFS-210
-        if (childMap == null) {
-            return null;
-        } else if (childMap.isEmpty()) {
+        // VFS-210. The map is never null, so an empty map is the folder with no entry.
+        if (childMap.isEmpty()) {
             return new String[0];
         }
 
@@ -447,20 +607,16 @@ public class FtpFileObject extends AbstractFileObject<FtpFileSystem> {
     @Override
     protected void doRename(final FileObject newFile) throws Exception {
         synchronized (getFileSystem()) {
-            final boolean ok;
+            final String newName = ((FtpFileObject) FileObjectUtils.getAbstractFileObject(newFile)).getRelPath();
             final FtpClient ftpClient = getAbstractFileSystem().getClient();
-            try {
-                final String newName = ((FtpFileObject) FileObjectUtils.getAbstractFileObject(newFile)).getRelPath();
-                ok = ftpClient.rename(relPath, newName);
-            } finally {
-                getAbstractFileSystem().putClient(ftpClient);
-            }
-
-            if (!ok) {
-                throw new FileSystemException("vfs.provider.ftp/rename-file.error", getName().toString(), newFile);
+            final FileSystemException refused = run(ftpClient, c -> c.rename(relPath, newName) ? null
+                    : refusal(c, "vfs.provider.ftp/rename-file-reply.error", false, getName().toString(), newFile));
+            giveBack(ftpClient, refused);
+            if (refused != null) {
+                throw refused;
             }
             ftpFile = null;
-            childMap = EMPTY_FTP_FILE_MAP;
+            childMap.clear();
         }
     }
 
@@ -477,15 +633,14 @@ public class FtpFileObject extends AbstractFileObject<FtpFileSystem> {
          * calling getChildFile() for themselves from within getInfo(). See getChildren().
          */
         if (flush && !inRefresh.get()) {
-            childMap = null;
+            childMap.clear();
         }
 
         // List the children of this file
         doGetChildren();
 
         // Look for the requested child
-        // VFS-210 adds the null check.
-        return childMap != null ? childMap.get(name) : null;
+        return childMap.get(name);
     }
 
     /**
@@ -522,19 +677,15 @@ public class FtpFileObject extends AbstractFileObject<FtpFileSystem> {
 
     FtpInputStream getInputStream(final long filePointer) throws IOException {
         final FtpClient client = getAbstractFileSystem().getClient();
-        try {
-            final InputStream instr = client.retrieveFileStream(relPath, filePointer);
-            // VFS-210
-            if (instr == null) {
-                throw new FileNotFoundException(getName().getFriendlyURI());
-            }
-            FileSystemException.requireNonNull(instr, "vfs.provider.ftp/input-error.debug", getName(),
-                    client.getReplyString());
-            return new FtpInputStream(client, instr);
-        } catch (final IOException e) {
-            getAbstractFileSystem().putClient(client);
-            throw e;
+        final InputStream instr = run(client, c -> c.retrieveFileStream(relPath, filePointer));
+        // VFS-210
+        if (instr == null) {
+            final FileSystemException refused = run(client,
+                    c -> notRead(c, getName().getFriendlyURI(), "vfs.provider.ftp/input-error.debug"));
+            giveBack(client, refused);
+            throw refused;
         }
+        return new FtpInputStream(client, instr);
     }
 
     private FileObject getLinkDestination() throws FileSystemException {
@@ -563,10 +714,11 @@ public class FtpFileObject extends AbstractFileObject<FtpFileSystem> {
         final FtpFileSystem abstractFileSystem = getAbstractFileSystem();
         final Boolean mdtmLastModifiedTime = FtpFileSystemConfigBuilder.getInstance()
             .getMdtmLastModifiedTime(abstractFileSystem.getFileSystemOptions());
-        if (mdtmLastModifiedTime != null && mdtmLastModifiedTime.booleanValue()) {
+        if (mdtmLastModifiedTime != null && mdtmLastModifiedTime.booleanValue() && !mdtmSet) {
             final FtpClient client = abstractFileSystem.getClient();
-            if (!mdtmSet && client.hasFeature("MDTM")) {
-                final Instant mdtmInstant = client.mdtmInstant(relPath);
+            final Instant mdtmInstant = run(client, this::mdtmTime);
+            abstractFileSystem.putClient(client);
+            if (mdtmInstant != null) {
                 final Calendar calendar = Calendar.getInstance(TimeZone.getTimeZone("GMT"));
                 final long epochMilli = mdtmInstant.toEpochMilli();
                 calendar.setTimeInMillis(epochMilli);
@@ -575,6 +727,23 @@ public class FtpFileObject extends AbstractFileObject<FtpFileSystem> {
             }
         }
         return ftpFile.getTimestamp().getTime().getTime();
+    }
+
+    // The time of MDTM, or null when the server does not list MDTM or gives no reply 213. Then the time of the
+    // listing is used, as when the server has no MDTM. A transport reply is an IOException of the wrapper.
+    private Instant mdtmTime(final FtpClient client) throws IOException {
+        if (!client.hasFeature("MDTM")) {
+            return null;
+        }
+        final Instant time = client.mdtmInstant(relPath);
+        if (time == null && log.isDebugEnabled()) {
+            final int reply = client.getReplyCode();
+            final String text = client.getReplyString();
+            log.debug("MDTM gave no time for \"" + getName().getFriendlyURI() + "\". The server replied \""
+                    + (text == null ? String.valueOf(reply) : text.trim()) + "\" (fault " + faultOf(reply, true)
+                    + "). The time of the listing is used.");
+        }
+        return time;
     }
 
     /**
@@ -589,7 +758,7 @@ public class FtpFileObject extends AbstractFileObject<FtpFileSystem> {
      */
     @Override
     protected void onChange() throws IOException {
-        childMap = null;
+        childMap.clear();
 
         if (getType().equals(FileType.IMAGINARY)) {
             // file is deleted, avoid server lookup
@@ -607,7 +776,7 @@ public class FtpFileObject extends AbstractFileObject<FtpFileSystem> {
      */
     @Override
     protected void onChildrenChanged(final FileName child, final FileType newType) {
-        if (childMap != null && newType.equals(FileType.IMAGINARY)) {
+        if (newType.equals(FileType.IMAGINARY)) {
 
             if (!(childMap.isEmpty())) {
 
@@ -631,7 +800,78 @@ public class FtpFileObject extends AbstractFileObject<FtpFileSystem> {
         } else {
             // if child was added we have to rescan the children
             // TODO - get rid of this
-            childMap = null;
+            childMap.clear();
+        }
+    }
+
+    // Runs one call on a client that this object took. An IOException of the call leaves the client out of step, so
+    // the client is discarded. Any other error gives it back, as before.
+    private <T> T run(final FtpClient client, final FtpCall<T> call) throws IOException {
+        try {
+            return call.run(client);
+        } catch (final IOException e) {
+            getAbstractFileSystem().discardClient(client);
+            throw e;
+        } catch (final RuntimeException | Error e) {
+            getAbstractFileSystem().putClient(client);
+            throw e;
+        }
+    }
+
+    // Gives the client back after a refusal, or discards it when the reply is a transport reply. The fault was read
+    // while the caller still held the client. A refusal that is not a transport reply leaves the client in step.
+    private void giveBack(final FtpClient client, final FileSystemException refused) {
+        if (refused != null && refused.getFault() == Fault.TRANSPORT) {
+            getAbstractFileSystem().discardClient(client);
+        } else {
+            getAbstractFileSystem().putClient(client);
+        }
+    }
+
+    // The error of a command that the server refused. The reply is read while the caller still holds the client, and
+    // it is the last value of the message.
+    private static FileSystemException refusal(final FtpClient client, final String code, final boolean read,
+            final Object... info) throws IOException {
+        final int reply = client.getReplyCode();
+        final String text = client.getReplyString();
+        final Object[] values = Arrays.copyOf(info, info.length + 1);
+        values[info.length] = text == null ? String.valueOf(reply) : text.trim();
+        final FileSystemException error = new FileSystemException(code, values);
+        error.setFault(faultOf(reply, read));
+        return error;
+    }
+
+    // A read that got no stream. Only a reply 550 is the file not found, and that is a hint, not a proof.
+    private static FileSystemException notRead(final FtpClient client, final String name, final String code)
+            throws IOException {
+        if (client.getReplyCode() == FTPReply.FILE_UNAVAILABLE) {
+            final FileSystemException error = new FileNotFoundException(name);
+            error.setFault(Fault.MISSING);
+            return error;
+        }
+        return refusal(client, code, true, name);
+    }
+
+    /**
+     * Gives the fault of a reply by the FTP table of the fault classes. A reply 550 to a read, a size or a time
+     * request is the hint that the name is not there. A reply 550 to a call that changes the server is a refusal.
+     *
+     * @param reply the reply code.
+     * @param read true for a call that only reads.
+     * @return the fault.
+     */
+    static Fault faultOf(final int reply, final boolean read) {
+        switch (reply) {
+        case FTPReply.SERVICE_NOT_AVAILABLE:
+        case FTPReply.CANNOT_OPEN_DATA_CONNECTION:
+        case FTPReply.TRANSFER_ABORTED:
+            return Fault.TRANSPORT;
+        case FTPReply.FILE_ACTION_NOT_TAKEN:
+            return Fault.BUSY;
+        case FTPReply.FILE_UNAVAILABLE:
+            return read ? Fault.MISSING : Fault.APPLICATION;
+        default:
+            return Fault.APPLICATION;
         }
     }
 

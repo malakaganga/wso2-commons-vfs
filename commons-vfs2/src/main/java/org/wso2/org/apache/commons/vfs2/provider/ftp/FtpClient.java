@@ -39,6 +39,27 @@ public interface FtpClient {
     boolean abort() throws IOException;
 
     /**
+     * Closes the sockets of the client at once. It sends no command and waits for no reply, so any thread may call it.
+     * A client after this call is not handed out again.
+     */
+    default void abortNow() {
+        // A client with no socket group has nothing to close here.
+    }
+
+    /**
+     * Tells from local state whether the client looks alive. It makes no remote call.
+     *
+     * @return true when the client is connected and was not aborted.
+     */
+    default boolean isAliveLocally() {
+        try {
+            return isConnected();
+        } catch (final FileSystemException e) {
+            return false;
+        }
+    }
+
+    /**
      * Returns an OutputStream through which data can be written to append to a file on the server with the given name.
      *
      * @param relPath The name of the remote file.

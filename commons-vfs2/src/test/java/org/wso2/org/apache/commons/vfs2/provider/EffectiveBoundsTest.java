@@ -230,6 +230,6 @@ public class EffectiveBoundsTest {
 
     @Test
     public void schemeWithNoKnownBoundsIsRefused() {
-        assertThrows(IllegalArgumentException.class, () -> EffectiveBounds.of("ftp", new FileSystemOptions()));
+        assertThrows(IllegalArgumentException.class, () -> EffectiveBounds.of("smb2", new FileSystemOptions()));
     }
 }

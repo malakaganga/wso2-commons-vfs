@@ -118,7 +118,7 @@ public class LibraryCallsTest {
                     "java.lang.String"),
             new Call("org.apache.commons.net.ftp.FTPSClient", "_connectAction_"),
             new Call("org.apache.commons.net.util.SSLContextUtils", "createSSLContext", "java.lang.String",
-                    "javax.net.ssl.KeyManager", "javax.net.ssl.TrustManager"),
+                    "javax.net.ssl.KeyManager[]", "javax.net.ssl.TrustManager[]"),
             // smbj
             new Call("com.hierynomus.smbj.SmbConfig", "builder"),
             new Call("com.hierynomus.smbj.SmbConfig", "getReadTimeout"),

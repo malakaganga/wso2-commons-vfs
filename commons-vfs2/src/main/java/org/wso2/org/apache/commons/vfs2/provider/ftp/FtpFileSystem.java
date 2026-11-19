@@ -18,7 +18,10 @@ package org.wso2.org.apache.commons.vfs2.provider.ftp;
 
 import java.io.IOException;
 import java.util.Collection;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Supplier;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
@@ -27,9 +30,12 @@ import org.wso2.org.apache.commons.vfs2.FileObject;
 import org.wso2.org.apache.commons.vfs2.FileSystemException;
 import org.wso2.org.apache.commons.vfs2.FileSystemOptions;
 import org.wso2.org.apache.commons.vfs2.VfsLog;
+import org.wso2.org.apache.commons.vfs2.impl.DefaultFileSystemManager;
 import org.wso2.org.apache.commons.vfs2.provider.AbstractFileName;
 import org.wso2.org.apache.commons.vfs2.provider.AbstractFileSystem;
+import org.wso2.org.apache.commons.vfs2.provider.EffectiveBounds;
 import org.wso2.org.apache.commons.vfs2.provider.GenericFileName;
+import org.wso2.org.apache.commons.vfs2.util.SocketGroup;
 
 /**
  * An FTP file system.
@@ -43,8 +49,16 @@ public class FtpFileSystem extends AbstractFileSystem {
     // private final String username;
     // private final String password;
 
-    // An idle client
+    // An idle client. It is one of the clients below.
     private final AtomicReference<FtpClient> idleClient = new AtomicReference<>();
+
+    // Every client of this file system, the idle one and the ones that a call or an open stream holds. A client is in
+    // this set from the end of its connect until it is closed or discarded, also while it moves into or out of the
+    // idle slot, so an abort always finds it.
+    private final Set<FtpClient> clients = ConcurrentHashMap.newKeySet();
+
+    // The options that the clients are made with. The provider writes the values of the URI into a copy.
+    private final FileSystemOptions clientOptions;
 
     private volatile boolean isFileSystemClosed = false;
 
@@ -58,11 +72,28 @@ public class FtpFileSystem extends AbstractFileSystem {
      */
     public FtpFileSystem(final GenericFileName rootName, final FtpClient ftpClient,
             final FileSystemOptions fileSystemOptions) {
+        this(rootName, ftpClient, fileSystemOptions, fileSystemOptions);
+    }
+
+    /**
+     * Constructs a new instance whose clients are made with other options than the options of the caller.
+     *
+     * @param rootName The root of the file system.
+     * @param ftpClient The FtpClient.
+     * @param fileSystemOptions The FileSystemOptions of the caller, which are the key of the file system.
+     * @param clientOptions The options of the clients.
+     */
+    public FtpFileSystem(final GenericFileName rootName, final FtpClient ftpClient,
+            final FileSystemOptions fileSystemOptions, final FileSystemOptions clientOptions) {
         super(rootName, null, fileSystemOptions);
         // hostname = rootName.getHostName();
         // port = rootName.getPort();
 
-        idleClient.set(ftpClient);
+        this.clientOptions = clientOptions;
+        if (ftpClient != null) {
+            clients.add(ftpClient);
+            idleClient.set(ftpClient);
+        }
     }
 
     /**
@@ -106,7 +137,26 @@ public class FtpFileSystem extends AbstractFileSystem {
      * @since 2.1
      */
     protected FTPClientWrapper createWrapper() throws FileSystemException {
-        return new FTPClientWrapper((GenericFileName) getRoot().getName(), getFileSystemOptions());
+        return new FTPClientWrapper((GenericFileName) getRoot().getName(), getClientOptions(), getSocketGroups());
+    }
+
+    /**
+     * Gets the options that the clients of this file system are made with.
+     *
+     * @return the options.
+     */
+    protected FileSystemOptions getClientOptions() {
+        return clientOptions;
+    }
+
+    /**
+     * Gets the source of the socket groups of new clients. The manager keeps each group, so an abort of the manager
+     * reaches every socket of the clients.
+     *
+     * @return the source.
+     */
+    protected Supplier<SocketGroup> getSocketGroups() {
+        return ((DefaultFileSystemManager) getFileSystemManager())::newSocketGroup;
     }
 
     @Override
@@ -116,6 +166,7 @@ public class FtpFileSystem extends AbstractFileSystem {
         // Clean up the connection
         if (idle != null) {
             closeConnection(idle);
+            clients.remove(idle);
         }
     }
 
@@ -126,12 +177,16 @@ public class FtpFileSystem extends AbstractFileSystem {
      * @throws FileSystemException if an error occurs.
      */
     public FtpClient getClient() throws FileSystemException {
-        FtpClient client = idleClient.getAndSet(null);
-
-        if (client == null || !client.isConnected()) {
-            client = createWrapper();
+        final FtpClient idle = idleClient.getAndSet(null);
+        if (idle != null) {
+            if (idle.isConnected()) {
+                return idle;
+            }
+            // A closed or aborted client is not handed out. Its sockets are closed with no command.
+            discardClient(idle);
         }
-
+        final FtpClient client = createWrapper();
+        clients.add(client);
         return client;
     }
 
@@ -142,12 +197,74 @@ public class FtpFileSystem extends AbstractFileSystem {
      */
     public void putClient(final FtpClient client) {
         // Save client for reuse if none is idle.
-        if (isFileSystemClosed) {
-            // The file system has already been closed; don't strand this connection in idleClient.
+        if (isFileSystemClosed || !idleClient.compareAndSet(null, client)) {
+            // The file system is closed, or an idle client is already present, so close the connection.
             closeConnection(client);
-        } else if (!idleClient.compareAndSet(null, client)) {
-            // An idle client is already present so close the connection.
+            clients.remove(client);
+        } else if (isFileSystemClosed && idleClient.compareAndSet(client, null)) {
+            // The close came after the check above and may have found the slot empty. Then the client is closed here,
+            // so it is not left in the slot of a closed file system.
             closeConnection(client);
+            clients.remove(client);
         }
+    }
+
+    /**
+     * Takes back a client whose call did not end with a good reply, and never hands it out again. Its sockets are
+     * closed with no command, so nothing waits on the server.
+     *
+     * @param client The FTPClient.
+     */
+    public void discardClient(final FtpClient client) {
+        client.abortNow();
+        clients.remove(client);
+    }
+
+    /**
+     * Closes the sockets of the idle client and of every client that is out. It sends no command and takes no
+     * monitor, so any thread may call it.
+     */
+    @Override
+    public void abort() {
+        for (final FtpClient client : clients) {
+            client.abortNow();
+        }
+    }
+
+    /**
+     * Tells from local state whether the idle client and every client that is out are connected and not aborted.
+     *
+     * @return false when one of them is closed or aborted.
+     */
+    @Override
+    public boolean isAliveLocally() {
+        for (final FtpClient client : clients) {
+            if (!client.isAliveLocally()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Gets the timeouts that the clients of this file system enforce. They come from the options that the clients are
+     * made with, which hold the values of the URI too.
+     *
+     * @return the bounds in effect.
+     */
+    @Override
+    public EffectiveBounds getEffectiveBounds() {
+        return EffectiveBounds.of(getRootName().getScheme(), clientOptions);
+    }
+
+    @Override
+    public int getHandedOutCount() {
+        final int all = clients.size();
+        return idleClient.get() != null ? Math.max(0, all - 1) : all;
+    }
+
+    @Override
+    public int getOpenClientCount() {
+        return clients.size();
     }
 }

@@ -25,6 +25,8 @@ import org.apache.commons.lang3.time.DurationUtils;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.wso2.org.apache.commons.vfs2.FileSystemOptions;
+import org.wso2.org.apache.commons.vfs2.provider.ftp.FtpFileSystemConfigBuilder;
+import org.wso2.org.apache.commons.vfs2.provider.ftps.FtpsFileSystemConfigBuilder;
 import org.wso2.org.apache.commons.vfs2.provider.sftp.SftpFileSystemConfigBuilder;
 
 /**
@@ -126,6 +128,16 @@ public final class EffectiveBounds {
 
     private static final String SFTP = "sftp";
 
+    private static final String FTP = "ftp";
+
+    private static final String FTPS = "ftps";
+
+    private static final long FTP_CONNECT_TIMEOUT_MILLIS = 30000;
+
+    private static final long FTP_SOCKET_TIMEOUT_MILLIS = 60000;
+
+    private static final long FTP_DATA_TIMEOUT_MILLIS = 60000;
+
     private static final long SFTP_TIMEOUT_MILLIS = 30000;
 
     private static final long SFTP_KEEP_ALIVE_COUNT = 3;
@@ -152,13 +164,25 @@ public final class EffectiveBounds {
 
     private final Bound writeStallTimeout;
 
+    private final Bound socketTimeout;
+
+    private final Bound dataTimeout;
+
     private EffectiveBounds(final String scheme, final Bound connectTimeout, final Bound sessionTimeout,
             final Bound keepAliveCount, final Bound writeStallTimeout) {
+        this(scheme, connectTimeout, sessionTimeout, keepAliveCount, writeStallTimeout, null, null);
+    }
+
+    private EffectiveBounds(final String scheme, final Bound connectTimeout, final Bound sessionTimeout,
+            final Bound keepAliveCount, final Bound writeStallTimeout, final Bound socketTimeout,
+            final Bound dataTimeout) {
         this.scheme = scheme;
         this.connectTimeout = connectTimeout;
         this.sessionTimeout = sessionTimeout;
         this.keepAliveCount = keepAliveCount;
         this.writeStallTimeout = writeStallTimeout;
+        this.socketTimeout = socketTimeout;
+        this.dataTimeout = dataTimeout;
     }
 
     /**
@@ -172,6 +196,12 @@ public final class EffectiveBounds {
     public static EffectiveBounds of(final String scheme, final FileSystemOptions options) {
         if (SFTP.equals(scheme)) {
             return sftp(options);
+        }
+        if (FTP.equals(scheme)) {
+            return ftp(FTP, FtpFileSystemConfigBuilder.getInstance(), options);
+        }
+        if (FTPS.equals(scheme)) {
+            return ftp(FTPS, FtpsFileSystemConfigBuilder.getInstance(), options);
         }
         throw new IllegalArgumentException("The bounds of the scheme " + scheme + " are not known.");
     }
@@ -204,6 +234,20 @@ public final class EffectiveBounds {
                 : new Bound(WRITE_STALL_TIMEOUT_MILLIS, Source.DEFAULT);
 
         return new EffectiveBounds(SFTP, connect, session, count, writeStall);
+    }
+
+    // Each value is the endpoint option, else the default. FTP has no system property and no derived value.
+    private static EffectiveBounds ftp(final String scheme, final FtpFileSystemConfigBuilder builder,
+            final FileSystemOptions options) {
+        final Bound connect = endpointOr(builder.getConnectTimeoutDuration(options), FTP_CONNECT_TIMEOUT_MILLIS);
+        final Bound socket = endpointOr(builder.getSoTimeoutDuration(options), FTP_SOCKET_TIMEOUT_MILLIS);
+        final Bound data = endpointOr(builder.getDataTimeoutDuration(options), FTP_DATA_TIMEOUT_MILLIS);
+        final Bound stall = endpointOr(builder.getWriteStallTimeout(options), WRITE_STALL_TIMEOUT_MILLIS);
+        return new EffectiveBounds(scheme, connect, null, null, stall, socket, data);
+    }
+
+    private static Bound endpointOr(final Duration endpoint, final long defaultMillis) {
+        return endpoint != null ? new Bound(millis(endpoint), Source.ENDPOINT) : new Bound(defaultMillis, Source.DEFAULT);
     }
 
     private static Bound first(final Bound... steps) {
@@ -289,6 +333,24 @@ public final class EffectiveBounds {
         return writeStallTimeout;
     }
 
+    /**
+     * Gets the socket timeout, which bounds each control reply on FTP and FTPS.
+     *
+     * @return the bound, or null for a scheme that has none.
+     */
+    public Bound getSocketTimeout() {
+        return socketTimeout;
+    }
+
+    /**
+     * Gets the data timeout, which bounds each data read and the wait for an active data connection on FTP and FTPS.
+     *
+     * @return the bound, or null for a scheme that has none.
+     */
+    public Bound getDataTimeout() {
+        return dataTimeout;
+    }
+
     @Override
     public boolean equals(final Object other) {
         if (!(other instanceof EffectiveBounds)) {
@@ -298,16 +360,22 @@ public final class EffectiveBounds {
         return scheme.equals(bounds.scheme) && Objects.equals(connectTimeout, bounds.connectTimeout)
                 && Objects.equals(sessionTimeout, bounds.sessionTimeout)
                 && Objects.equals(keepAliveCount, bounds.keepAliveCount)
-                && Objects.equals(writeStallTimeout, bounds.writeStallTimeout);
+                && Objects.equals(writeStallTimeout, bounds.writeStallTimeout)
+                && Objects.equals(socketTimeout, bounds.socketTimeout) && Objects.equals(dataTimeout, bounds.dataTimeout);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(scheme, connectTimeout, sessionTimeout, keepAliveCount, writeStallTimeout);
+        return Objects.hash(scheme, connectTimeout, sessionTimeout, keepAliveCount, writeStallTimeout, socketTimeout,
+                dataTimeout);
     }
 
     @Override
     public String toString() {
+        if (socketTimeout != null) {
+            return scheme + ": connect timeout " + connectTimeout + ", socket timeout " + socketTimeout
+                    + ", data timeout " + dataTimeout + ", write stall timeout " + writeStallTimeout;
+        }
         return scheme + ": connect timeout " + connectTimeout + ", session timeout " + sessionTimeout
                 + ", keep alive count " + keepAliveCount + ", write stall timeout " + writeStallTimeout;
     }
