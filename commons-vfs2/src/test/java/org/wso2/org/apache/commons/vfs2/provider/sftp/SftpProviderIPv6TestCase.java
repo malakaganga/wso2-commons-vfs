@@ -27,6 +27,7 @@ import org.wso2.org.apache.commons.vfs2.FileSystem;
 import org.wso2.org.apache.commons.vfs2.FileSystemOptions;
 import org.wso2.org.apache.commons.vfs2.IPv6LocalConnectionTests;
 import org.wso2.org.apache.commons.vfs2.provider.GenericFileName;
+import org.wso2.org.apache.commons.vfs2.util.SocketGroup;
 import org.mockito.Mockito;
 
 import com.jcraft.jsch.ChannelExec;
@@ -59,7 +60,7 @@ public class SftpProviderIPv6TestCase extends AbstractSftpProviderTestCase {
                 throw new AssertionError("Should never happen", e);
             }
 
-            return new SftpFileSystem(rootName, sessionMock, fileSystemOptions);
+            return new SftpFileSystem(rootName, sessionMock, new SocketGroup(), fileSystemOptions);
         }
     }
 

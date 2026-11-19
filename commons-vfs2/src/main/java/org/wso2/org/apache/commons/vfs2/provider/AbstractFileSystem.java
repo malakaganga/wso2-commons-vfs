@@ -147,6 +147,17 @@ public abstract class AbstractFileSystem extends AbstractVfsComponent implements
     }
 
     /**
+     * Gets the timeouts that the fork enforces for this file system. It is the answer of
+     * {@link EffectiveBounds#of(String, FileSystemOptions)} for the scheme and the options of this file system. It reads
+     * no socket and makes no remote call, so any thread may call it.
+     *
+     * @return the bounds in effect.
+     */
+    public EffectiveBounds getEffectiveBounds() {
+        return EffectiveBounds.of(getRootName().getScheme(), getFileSystemOptions());
+    }
+
+    /**
      * Gets the number of clients that this file system has handed out and not got back.
      *
      * @return the count. This base method answers zero.

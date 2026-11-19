@@ -264,15 +264,6 @@
             <!-- Need to port fully to JUnit 4 or 5. -->
             <!-- *Tests.java files with @Test methods should not be run since these classes are in fact JUnit 3 classes used in custom JUnit 3 test suites. -->
             <exclude>**/*Tests.java</exclude>
-            <!-- The SFTP test server, sshd-core 0.8.0, offers only the key exchanges diffie-hellman-group14-sha1
-                 and diffie-hellman-group1-sha1. JSch 2.27.7 proposes neither, so these suites can not open a
-                 session and fail in their set up. -->
-            <exclude>**/SftpProviderTestCase.java</exclude>
-            <exclude>**/SftpProviderIPv6TestCase.java</exclude>
-            <exclude>**/SftpProviderStreamProxyModeTestCase.java</exclude>
-            <exclude>**/SftpProviderClosedExecChannelTestCase.java</exclude>
-            <exclude>**/SftpPermissionExceptionTestCase.java</exclude>
-            <exclude>**/SftpPutChannelTestCase.java</exclude>
           </excludes>
         </configuration>
       </plugin>

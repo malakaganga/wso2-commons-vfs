@@ -16,6 +16,8 @@
  */
 package org.wso2.org.apache.commons.vfs2.provider.sftp;
 
+import java.io.FilterInputStream;
+import java.io.FilterOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -34,6 +36,7 @@ import org.wso2.org.apache.commons.vfs2.RandomAccessContent;
 import org.wso2.org.apache.commons.vfs2.VFS;
 import org.wso2.org.apache.commons.vfs2.provider.AbstractFileName;
 import org.wso2.org.apache.commons.vfs2.provider.AbstractFileObject;
+import org.wso2.org.apache.commons.vfs2.provider.Faults;
 import org.wso2.org.apache.commons.vfs2.provider.UriParser;
 import org.wso2.org.apache.commons.vfs2.util.FileObjectUtils;
 import org.wso2.org.apache.commons.vfs2.util.MonitorInputStream;
@@ -54,18 +57,34 @@ public class SftpFileObject extends AbstractFileObject<SftpFileSystem> {
 
     /**
      * An InputStream that monitors for end-of-file.
+     * <p>
+     * It notes the first exception of a read or a close on the stream of JSch. Its close puts the channel back only
+     * when none was noted. Else it discards the channel and its session.
+     * </p>
      */
     private final class SftpInputStream extends MonitorInputStream {
         private final ChannelSftp channel;
 
+        private final NotedInput source;
+
         SftpInputStream(final ChannelSftp channel, final InputStream in) {
-            super(in);
-            this.channel = channel;
+            this(channel, new NotedInput(in));
         }
 
         SftpInputStream(final ChannelSftp channel, final InputStream in, final int bufferSize) {
-            super(in, bufferSize);
+            this(channel, new NotedInput(in), bufferSize);
+        }
+
+        private SftpInputStream(final ChannelSftp channel, final NotedInput source) {
+            super(source);
             this.channel = channel;
+            this.source = source;
+        }
+
+        private SftpInputStream(final ChannelSftp channel, final NotedInput source, final int bufferSize) {
+            super(source, bufferSize);
+            this.channel = channel;
+            this.source = source;
         }
 
         /**
@@ -73,19 +92,30 @@ public class SftpFileObject extends AbstractFileObject<SftpFileSystem> {
          */
         @Override
         protected void onClose() throws IOException {
-            putChannel(channel);
+            releaseNoted(channel, source.failure);
         }
     }
 
     /**
      * An OutputStream that wraps an sftp OutputStream, and closes the channel when the stream is closed.
+     * <p>
+     * It notes the first exception of a write, a flush or a close on the stream of JSch. Its close puts the channel
+     * back only when none was noted. Else it discards the channel and its session.
+     * </p>
      */
     private final class SftpOutputStream extends MonitorOutputStream {
         private final ChannelSftp channel;
 
+        private final NotedOutput target;
+
         SftpOutputStream(final ChannelSftp channel, final OutputStream out) {
-            super(out);
+            this(channel, new NotedOutput(out));
+        }
+
+        private SftpOutputStream(final ChannelSftp channel, final NotedOutput target) {
+            super(target);
             this.channel = channel;
+            this.target = target;
         }
 
         /**
@@ -93,7 +123,124 @@ public class SftpFileObject extends AbstractFileObject<SftpFileSystem> {
          */
         @Override
         protected void onClose() throws IOException {
-            putChannel(channel);
+            releaseNoted(channel, target.failure);
+        }
+    }
+
+    /**
+     * The stream of JSch for a read, which notes its first exception.
+     */
+    private static final class NotedInput extends FilterInputStream {
+
+        private volatile Throwable failure;
+
+        NotedInput(final InputStream in) {
+            super(in);
+        }
+
+        @Override
+        public int read() throws IOException {
+            try {
+                return super.read();
+            } catch (final IOException | RuntimeException e) {
+                note(e);
+                throw e;
+            }
+        }
+
+        @Override
+        public int read(final byte[] buffer, final int offset, final int length) throws IOException {
+            try {
+                return super.read(buffer, offset, length);
+            } catch (final IOException | RuntimeException e) {
+                note(e);
+                throw e;
+            }
+        }
+
+        @Override
+        public long skip(final long count) throws IOException {
+            try {
+                return super.skip(count);
+            } catch (final IOException | RuntimeException e) {
+                note(e);
+                throw e;
+            }
+        }
+
+        @Override
+        public void close() throws IOException {
+            try {
+                super.close();
+            } catch (final IOException | RuntimeException e) {
+                note(e);
+                throw e;
+            }
+        }
+
+        private void note(final Throwable error) {
+            if (failure == null) {
+                failure = error;
+            }
+        }
+    }
+
+    /**
+     * The stream of JSch for a write, which notes its first exception.
+     */
+    private static final class NotedOutput extends FilterOutputStream {
+
+        private volatile Throwable failure;
+
+        NotedOutput(final OutputStream out) {
+            super(out);
+        }
+
+        @Override
+        public void write(final int value) throws IOException {
+            try {
+                out.write(value);
+            } catch (final IOException | RuntimeException e) {
+                note(e);
+                throw e;
+            }
+        }
+
+        @Override
+        public void write(final byte[] buffer, final int offset, final int length) throws IOException {
+            try {
+                out.write(buffer, offset, length);
+            } catch (final IOException | RuntimeException e) {
+                note(e);
+                throw e;
+            }
+        }
+
+        @Override
+        public void flush() throws IOException {
+            try {
+                out.flush();
+            } catch (final IOException | RuntimeException e) {
+                note(e);
+                throw e;
+            }
+        }
+
+        // The stream above flushes before it closes, so the close does not flush again.
+        @Override
+        public void close() throws IOException {
+            try {
+                out.close();
+            } catch (final IOException | RuntimeException e) {
+                note(e);
+                throw e;
+            }
+        }
+
+        private void note(final Throwable error) {
+            if (failure == null) {
+                failure = error;
+            }
         }
     }
     private static final long MOD_TIME_FACTOR = 1000L;
@@ -120,10 +267,14 @@ public class SftpFileObject extends AbstractFileObject<SftpFileSystem> {
     @Override
     protected void doCreateFolder() throws Exception {
         final ChannelSftp channel = getAbstractFileSystem().getChannel();
+        Throwable failure = null;
         try {
             channel.mkdir(relPath);
+        } catch (final Throwable e) {
+            failure = e;
+            throw e;
         } finally {
-            putChannel(channel);
+            release(channel, failure);
         }
     }
 
@@ -133,14 +284,22 @@ public class SftpFileObject extends AbstractFileObject<SftpFileSystem> {
     @Override
     protected void doDelete() throws Exception {
         final ChannelSftp channel = getAbstractFileSystem().getChannel();
+        // Only the failure of a call on this channel decides what happens to it.
+        Throwable failure = null;
         try {
-            if (isFile()) {
-                channel.rm(relPath);
-            } else {
-                channel.rmdir(relPath);
+            final boolean file = isFile();
+            try {
+                if (file) {
+                    channel.rm(relPath);
+                } else {
+                    channel.rmdir(relPath);
+                }
+            } catch (final Throwable e) {
+                failure = e;
+                throw e;
             }
         } finally {
-            putChannel(channel);
+            release(channel, failure);
         }
     }
 
@@ -182,21 +341,29 @@ public class SftpFileObject extends AbstractFileObject<SftpFileSystem> {
              */
 
             final InputStream inputStream;
+            // VFS-210: sftp allows to gather an input stream even from a directory and will
+            // fail on first read. So we need to check the type anyway. No call on this channel ran yet, so it goes back.
+            final boolean hasContent;
             try {
-                // VFS-210: sftp allows to gather an input stream even from a directory and will
-                // fail on first read. So we need to check the type anyway
-                if (!getType().hasContent()) {
-                    throw new FileSystemException("vfs.provider/read-not-file.error", getName());
-                }
+                hasContent = getType().hasContent();
+            } catch (final Throwable e) {
+                release(channel, null);
+                throw e;
+            }
+            if (!hasContent) {
+                release(channel, null);
+                throw new FileSystemException("vfs.provider/read-not-file.error", getName());
+            }
+            try {
                 inputStream = channel.get(relPath);
             } catch (final SftpException e) {
-                putChannel(channel);
-                if (e.id == ChannelSftp.SSH_FX_NO_SUCH_FILE) {
+                release(channel, e);
+                if (e.id == ChannelSftp.SSH_FX_NO_SUCH_FILE && e.getCause() == null) {
                     throw new FileNotFoundException(getName());
                 }
                 throw new FileSystemException(e);
-            } catch (final Exception e) {
-                putChannel(channel);
+            } catch (final Throwable e) {
+                release(channel, e);
                 throw e;
             }
             return new SftpInputStream(channel, inputStream, bufferSize);
@@ -225,8 +392,8 @@ public class SftpFileObject extends AbstractFileObject<SftpFileSystem> {
         final ChannelSftp channel = getAbstractFileSystem().getChannel();
         try {
             return new SftpOutputStream(channel, channel.put(relPath, bAppend ? ChannelSftp.APPEND : ChannelSftp.OVERWRITE));
-        } catch (final Exception ex) {
-            putChannel(channel);
+        } catch (final Throwable ex) {
+            release(channel, ex);
             throw ex;
         }
 
@@ -308,45 +475,23 @@ public class SftpFileObject extends AbstractFileObject<SftpFileSystem> {
             return null;
         }
         // List the contents of the folder
-        Vector<?> vector = null;
+        final Vector<?> vector;
         final ChannelSftp channel = getAbstractFileSystem().getChannel();
-
+        // The failure that decides what happens to the channel.
+        final Throwable[] failure = new Throwable[1];
         try {
-            // try the direct way to list the directory on the server to avoid too many round trips
-            vector = channel.ls(relPath);
-        } catch (final SftpException e) {
-            String workingDirectory = null;
-            try {
-                if (relPath != null) {
-                    workingDirectory = channel.pwd();
-                    channel.cd(relPath);
-                }
-            } catch (final SftpException ex) {
-                // VFS-210: seems not to be a directory
-                return null;
+            vector = list(channel, failure);
+        } catch (final Throwable e) {
+            if (failure[0] == null) {
+                failure[0] = e;
             }
-
-            SftpException lsEx = null;
-            try {
-                vector = channel.ls(".");
-            } catch (final SftpException ex) {
-                lsEx = ex;
-            } finally {
-                try {
-                    if (relPath != null) {
-                        channel.cd(workingDirectory);
-                    }
-                } catch (final SftpException xe) {
-                    throw new FileSystemException("vfs.provider.sftp/change-work-directory-back.error",
-                            workingDirectory, lsEx);
-                }
-            }
-
-            if (lsEx != null) {
-                throw lsEx;
-            }
+            throw e;
         } finally {
-            putChannel(channel);
+            release(channel, failure[0]);
+        }
+        if (vector == null) {
+            // VFS-210: seems not to be a directory
+            return null;
         }
         FileSystemException.requireNonNull(vector, "vfs.provider.sftp/list-children.error");
 
@@ -377,16 +522,84 @@ public class SftpFileObject extends AbstractFileObject<SftpFileSystem> {
     }
 
     /**
+     * Lists this folder on the channel. A failure with a cause, which is a broken connection, stops at once and the
+     * caller discards the channel with its session. After a reply of the server the old way runs: a change into the
+     * folder and a list of ".", and then the change back. A channel that can not change back is in the wrong folder,
+     * so it is disconnected and never pooled.
+     *
+     * @param channel the channel.
+     * @param failure set to the failure that decides what happens to the channel.
+     * @return the listing, or null when the server says that this is not a folder.
+     */
+    private Vector<?> list(final ChannelSftp channel, final Throwable[] failure) throws Exception {
+        try {
+            // try the direct way to list the directory on the server to avoid too many round trips
+            return channel.ls(relPath);
+        } catch (final SftpException e) {
+            if (!SftpFileSystem.isReplyOrSuccess(e)) {
+                failure[0] = e;
+                throw e;
+            }
+        }
+        String workingDirectory = null;
+        try {
+            if (relPath != null) {
+                workingDirectory = channel.pwd();
+                channel.cd(relPath);
+            }
+        } catch (final SftpException ex) {
+            failure[0] = ex;
+            if (!SftpFileSystem.isReplyOrSuccess(ex)) {
+                throw ex;
+            }
+            return null;
+        }
+        Vector<?> vector = null;
+        SftpException lsEx = null;
+        try {
+            vector = channel.ls(".");
+        } catch (final SftpException ex) {
+            failure[0] = ex;
+            if (!SftpFileSystem.isReplyOrSuccess(ex)) {
+                throw ex;
+            }
+            lsEx = ex;
+        }
+        if (relPath != null) {
+            try {
+                channel.cd(workingDirectory);
+            } catch (final SftpException xe) {
+                failure[0] = xe;
+                channel.disconnect();
+                final FileSystemException restore = new FileSystemException(
+                        "vfs.provider.sftp/change-work-directory-back.error", workingDirectory, xe);
+                if (lsEx != null) {
+                    restore.addSuppressed(lsEx);
+                }
+                throw restore;
+            }
+        }
+        if (lsEx != null) {
+            throw lsEx;
+        }
+        return vector;
+    }
+
+    /**
      * Renames the file.
      */
     @Override
     protected void doRename(final FileObject newFile) throws Exception {
+        final SftpFileObject newSftpFileObject = (SftpFileObject) FileObjectUtils.getAbstractFileObject(newFile);
         final ChannelSftp channel = getAbstractFileSystem().getChannel();
+        Throwable failure = null;
         try {
-            final SftpFileObject newSftpFileObject = (SftpFileObject) FileObjectUtils.getAbstractFileObject(newFile);
             channel.rename(relPath, newSftpFileObject.relPath);
+        } catch (final Throwable e) {
+            failure = e;
+            throw e;
         } finally {
-            putChannel(channel);
+            release(channel, failure);
         }
     }
 
@@ -449,10 +662,14 @@ public class SftpFileObject extends AbstractFileObject<SftpFileSystem> {
 
     private synchronized void flushStat() throws IOException, SftpException {
         final ChannelSftp channel = getAbstractFileSystem().getChannel();
+        Throwable failure = null;
         try {
             channel.setStat(relPath, attrs);
+        } catch (final Throwable e) {
+            failure = e;
+            throw e;
         } finally {
-            putChannel(channel);
+            release(channel, failure);
         }
     }
 
@@ -461,14 +678,18 @@ public class SftpFileObject extends AbstractFileObject<SftpFileSystem> {
      * file.
      */
     InputStream getInputStream(final long filePointer) throws IOException {
+        final String path = getName().getPathDecoded();
         final ChannelSftp channel = getAbstractFileSystem().getChannel();
         // Using InputStream directly from the channel
         // is much faster than the memory method.
         try {
-            return new SftpInputStream(channel, channel.get(getName().getPathDecoded(), null, filePointer));
+            return new SftpInputStream(channel, channel.get(path, null, filePointer));
         } catch (final SftpException e) {
-            putChannel(channel);
+            release(channel, e);
             throw new FileSystemException(e);
+        } catch (final Throwable e) {
+            release(channel, e);
+            throw e;
         }
     }
 
@@ -484,21 +705,26 @@ public class SftpFileObject extends AbstractFileObject<SftpFileSystem> {
         statSelf();
         boolean isInGroup = false;
         if (checkIds) {
-            if (getAbstractFileSystem().isExecDisabled()) {
+            if (getAbstractFileSystem().isExecDisabledForCheck()) {
                 // Exec is disabled, so we won't be able to ascertain the current user's UID and GID.
                 // Return "always-true" permissions as a workaround, knowing that the SFTP server won't
                 // let us perform unauthorized actions anyway.
                 return new UserIsOwnerPosixPermissions(attrs.getPermissions());
             }
 
-            for (final int groupId : getAbstractFileSystem().getGroupsIds()) {
+            final int[] groupsIds = getAbstractFileSystem().getGroupsIdsForCheck();
+            // The probe of the groups can pass its deadline too, and then exec counts as disabled.
+            if (getAbstractFileSystem().isExecDisabledForCheck()) {
+                return new UserIsOwnerPosixPermissions(attrs.getPermissions());
+            }
+            for (final int groupId : groupsIds) {
                 if (groupId == attrs.getGId()) {
                     isInGroup = true;
                     break;
                 }
             }
         }
-        final boolean isOwner = checkIds && attrs.getUId() == getAbstractFileSystem().getUId();
+        final boolean isOwner = checkIds && attrs.getUId() == getAbstractFileSystem().getUIdForCheck();
         return new PosixPermissions(attrs.getPermissions(), isOwner, isInGroup);
     }
 
@@ -510,9 +736,20 @@ public class SftpFileObject extends AbstractFileObject<SftpFileSystem> {
         statSelf();
     }
 
+    // Every call site gives its channel back here, with the exception that ended its call or null.
     @SuppressWarnings("resource") // does not allocate
-    private void putChannel(final ChannelSftp channel) {
-        getAbstractFileSystem().putChannel(channel);
+    private void release(final ChannelSftp channel, final Throwable failure) {
+        getAbstractFileSystem().releaseChannel(channel, failure);
+    }
+
+    // A stream that noted an exception never puts its channel back.
+    @SuppressWarnings("resource") // does not allocate
+    private void releaseNoted(final ChannelSftp channel, final Throwable failure) {
+        if (failure == null) {
+            release(channel, null);
+        } else {
+            getAbstractFileSystem().discardChannel(channel);
+        }
     }
 
     /**
@@ -528,42 +765,58 @@ public class SftpFileObject extends AbstractFileObject<SftpFileSystem> {
      * @throws IOException if an error occurs.
      */
     private synchronized void statSelf() throws Exception {
-        ChannelSftp channelSftp = null;
+        // The fast window of this call opens here.
+        final long start = System.nanoTime();
+        final SftpFileSystem fileSystem = getAbstractFileSystem();
+        ChannelSftp channel = fileSystem.getChannel();
         try {
-            channelSftp = getAbstractFileSystem().getChannel();
-            setStat(channelSftp.stat(relPath));
+            setStat(channel.stat(relPath));
         } catch (final SftpException e) {
-                if (e.id == ChannelSftp.SSH_FX_NO_SUCH_FILE || e.id == ChannelSftp.SSH_FX_FAILURE) {
-                    // File does not exist or stat failed in a known way — treat as imaginary
-                    attrs = null;
-                    LOG.debug("NO_SUCH_FILE or STAT FAILURE — treating as non-existent");
-                } else {
-                    // Try one retry — possibly transient channel issue
-                    try {
-                        channelSftp.disconnect();
-                        channelSftp = getAbstractFileSystem().getChannel();
-                        setStat(channelSftp.stat(relPath));
-                    } catch (SftpException retryEx) {
-                        // TODO - not strictly true, but jsch 0.1.2 does not give us
-                        // enough info in the exception. Should be using:
-                        // if ( e.id == ChannelSftp.SSH_FX_NO_SUCH_FILE ) || e.id == ChannelSftp.SSH_FX_FAILURE )
-                        // However, sometimes the exception has the correct id, and
-                        // sometimes
-                        // it does not. Need to look into why.
-
-                        if (retryEx.id == ChannelSftp.SSH_FX_NO_SUCH_FILE || retryEx.id == ChannelSftp.SSH_FX_FAILURE) {
-                            attrs = null;
-                            LOG.debug("STAT retry failed (NO_SUCH_FILE or FAILURE) — treating as non-existent");
-                        } else {
-                            throw retryEx;
-                        }
-                    }
-                }
-        } finally {
-            if (channelSftp != null) {
-                putChannel(channelSftp);
+            if (e.id == ChannelSftp.SSH_FX_NO_SUCH_FILE && e.getCause() == null) {
+                release(channel, e);
+                attrs = null;
+                LOG.debug("SFTP server returned no such file for stat of '" + relPath + "', so the file is missing");
+                return;
             }
+            // The channel that failed is not handed back. A reply of the server leaves the session in use, and any
+            // other failure discards it.
+            if (SftpFileSystem.isReplyOrSuccess(e)) {
+                channel.disconnect();
+            }
+            release(channel, e);
+            if (!Faults.isFast(start)) {
+                // A slow failure gets no retry.
+                throw e;
+            }
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("Stat of '" + relPath + "' failed, retrying it on a fresh SFTP channel", e);
+            }
+            channel = fileSystem.getChannel();
+            try {
+                setStat(channel.stat(relPath));
+            } catch (final SftpException retryEx) {
+                final boolean connected = channel.isConnected();
+                release(channel, retryEx);
+                // A failure with a cause is a broken connection, whatever its id. Some servers reply with a failure
+                // for a file that is not there, so on a channel that is still up that reply counts as missing too.
+                if (retryEx.getCause() == null && (retryEx.id == ChannelSftp.SSH_FX_NO_SUCH_FILE
+                        || retryEx.id == ChannelSftp.SSH_FX_FAILURE && connected)) {
+                    attrs = null;
+                    LOG.debug("Stat retry of '" + relPath + "' found no file, so the file is missing");
+                    return;
+                }
+                throw retryEx;
+            } catch (final Throwable retryError) {
+                release(channel, retryError);
+                throw retryError;
+            }
+            release(channel, null);
+            return;
+        } catch (final Throwable error) {
+            release(channel, error);
+            throw error;
         }
+        release(channel, null);
     }
 
 }

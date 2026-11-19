@@ -1018,18 +1018,17 @@ public class DefaultFileSystemManager implements FileSystemManager {
                 }
 
                 String timeoutStr = queryParam.get(SftpConstants.TIMEOUT);
-                Integer timeout = null;
-                if (timeoutStr != null && builder.getTimeout(fileSystemOptions) == null) {
+                if (timeoutStr != null && !builder.isSessionTimeoutSet(fileSystemOptions)) {
                     try {
-                        timeout = Integer.parseInt(timeoutStr);
+                        int timeout = Integer.parseInt(timeoutStr);
+                        builder.setSessionTimeout(fileSystemOptions, Duration.ofMillis(timeout));
                     } catch (NumberFormatException e) {
                         log.warn("Invalid timeout " + timeoutStr + " specified in FileURI.");
                     }
-                    builder.setTimeout(fileSystemOptions, timeout);
                 }
 
                 String connectTimeoutStr = queryParam.get(SftpConstants.CONNECT_TIMEOUT);
-                if (connectTimeoutStr != null && Duration.ZERO.equals(builder.getConnectTimeout(fileSystemOptions))) {
+                if (connectTimeoutStr != null && !builder.isConnectTimeoutSet(fileSystemOptions)) {
                     try {
                         int connectTimeout = Integer.parseInt(connectTimeoutStr);
                         builder.setConnectTimeout(fileSystemOptions, Duration.ofMillis(connectTimeout));
