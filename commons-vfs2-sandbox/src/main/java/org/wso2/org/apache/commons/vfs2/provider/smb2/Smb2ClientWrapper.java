@@ -51,6 +51,7 @@ import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.wso2.org.apache.commons.vfs2.FileSystemException;
 import org.wso2.org.apache.commons.vfs2.FileSystemOptions;
+import org.wso2.org.apache.commons.vfs2.provider.EffectiveBounds;
 import org.wso2.org.apache.commons.vfs2.provider.Fault;
 import org.wso2.org.apache.commons.vfs2.provider.Faults;
 import org.wso2.org.apache.commons.vfs2.provider.GenericFileName;
@@ -77,9 +78,9 @@ public class Smb2ClientWrapper extends SMBClient {
 
     private static final Log LOG = LogFactory.getLog(Smb2ClientWrapper.class);
     private static final String BCFIPS = "BCFIPS";
+    private static final String SCHEME = "smb2";
     // The connect bound of the default socket factory of smbj. A factory of our own replaces that one, so it applies
     // the same bound itself.
-    private static final int CONNECT_TIMEOUT_MILLIS = 5000;
     private static final String ABORT_REASON = "The SMB2 client was aborted";
     private static final String LOST_REASON = "The connection of the SMB2 client was lost";
     private static final String CLOSED_REASON = "The SMB2 client was closed";
@@ -155,15 +156,15 @@ public class Smb2ClientWrapper extends SMBClient {
                 config.withEncryptData(true);
             }
         }
-        // smbj sends no keep alive and takes a read timeout of the socket as fatal, so a socket timeout would end a
-        // healthy idle connection. It stays 0.
+        // The values come from the bounds in effect, so the logged value is the applied one.
+        final EffectiveBounds bounds = EffectiveBounds.of(SCHEME, options);
         return config
-                .withReadTimeout(builder.getReadTimeout(options).toMillis(), TimeUnit.MILLISECONDS)
-                .withWriteTimeout(builder.getWriteTimeout(options).toMillis(), TimeUnit.MILLISECONDS)
-                .withTransactTimeout(builder.getTransactTimeout(options).toMillis(), TimeUnit.MILLISECONDS)
-                .withSoTimeout(0)
-                .withSocketFactory(new WatchedSocketFactory(group, CONNECT_TIMEOUT_MILLIS,
-                        builder.getWriteStallTimeout(options).toMillis()))
+                .withReadTimeout(bounds.getReadTimeout().getValue(), TimeUnit.MILLISECONDS)
+                .withWriteTimeout(bounds.getWriteTimeout().getValue(), TimeUnit.MILLISECONDS)
+                .withTransactTimeout(bounds.getTransactTimeout().getValue(), TimeUnit.MILLISECONDS)
+                .withSoTimeout((int) bounds.getSocketTimeout().getValue())
+                .withSocketFactory(new WatchedSocketFactory(group, (int) bounds.getConnectTimeout().getValue(),
+                        bounds.getWriteStallTimeout().getValue()))
                 .withTransportLayerFactory(new ReaderWatch(lost))
                 .build();
     }

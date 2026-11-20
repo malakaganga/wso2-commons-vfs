@@ -17,11 +17,15 @@
 package org.wso2.org.apache.commons.vfs2.provider.local;
 
 import java.io.File;
-import java.io.FileInputStream;
+import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
+import java.nio.file.NotDirectoryException;
+import java.nio.file.Path;
+import java.nio.file.attribute.BasicFileAttributes;
 
 import org.apache.commons.io.file.PathUtils;
 import org.wso2.org.apache.commons.vfs2.FileObject;
@@ -74,9 +78,8 @@ public class LocalFile extends AbstractFileObject<LocalFileSystem> {
      */
     @Override
     protected void doCreateFolder() throws Exception {
-        if (!file.mkdirs()) {
-            throw new FileSystemException("vfs.provider.local/create-folder.error", file);
-        }
+        // The class and the reason of a failure reach the caller, which a false of java.io.File does not give.
+        Files.createDirectories(file.toPath());
     }
 
     /**
@@ -84,9 +87,7 @@ public class LocalFile extends AbstractFileObject<LocalFileSystem> {
      */
     @Override
     protected void doDelete() throws Exception {
-        if (!file.delete()) {
-            throw new FileSystemException("vfs.provider.local/delete-file.error", file);
-        }
+        Files.delete(file.toPath());
     }
 
     /**
@@ -102,7 +103,20 @@ public class LocalFile extends AbstractFileObject<LocalFileSystem> {
      */
     @Override
     protected InputStream doGetInputStream(final int bufferSize) throws Exception {
-        return new FileInputStream(file);
+        // FileInputStream gives FileNotFoundException for every failed open, also on an unavailable mount. So the
+        // attributes are read once first, and a failure keeps its typed cause. Only a name that is not there, and a
+        // folder, stay the public outcome that the file is not a readable file.
+        final Path path = file.toPath();
+        try {
+            if (Files.readAttributes(path, BasicFileAttributes.class).isDirectory()) {
+                throw new FileNotFoundException(file.getPath() + " (Is a directory)");
+            }
+            return Files.newInputStream(path);
+        } catch (final NoSuchFileException | NotDirectoryException e) {
+            final FileNotFoundException missing = new FileNotFoundException(file.getPath());
+            missing.initCause(e);
+            throw missing;
+        }
     }
 
     /**
@@ -136,14 +150,13 @@ public class LocalFile extends AbstractFileObject<LocalFileSystem> {
      * Returns the file's type.
      */
     @Override
-    protected FileType doGetType() {
-        if (!file.exists()) {
+    protected FileType doGetType() throws IOException {
+        try {
+            final BasicFileAttributes attributes = Files.readAttributes(file.toPath(), BasicFileAttributes.class);
+            return attributes.isDirectory() ? FileType.FOLDER : FileType.FILE;
+        } catch (final NoSuchFileException | NotDirectoryException missing) {
             return FileType.IMAGINARY;
         }
-        if (file.isDirectory()) {
-            return FileType.FOLDER;
-        }
-        return FileType.FILE;
     }
 
     /**

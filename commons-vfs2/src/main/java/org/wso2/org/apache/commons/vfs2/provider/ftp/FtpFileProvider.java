@@ -108,7 +108,7 @@ public class FtpFileProvider extends AbstractOriginatingFileProvider {
             }
         }
 
-        final FTPClientWrapper ftpClient = new FTPClientWrapper(rootName, opts, getSocketGroups());
+        final FTPClientWrapper ftpClient = new FTPClientWrapper(rootName, opts, getSocketGroups(), windowStart);
         /*
          * FTPClient ftpClient = FtpClientFactory.createConnection(rootName.getHostName(), rootName.getPort(),
          * rootName.getUserName(), rootName.getPassword(), rootName.getPath(), fileSystemOptions);

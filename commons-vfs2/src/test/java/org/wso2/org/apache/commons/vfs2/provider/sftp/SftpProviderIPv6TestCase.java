@@ -31,6 +31,8 @@ import org.wso2.org.apache.commons.vfs2.util.SocketGroup;
 import org.mockito.Mockito;
 
 import com.jcraft.jsch.ChannelExec;
+import com.jcraft.jsch.SftpException;
+import com.jcraft.jsch.ChannelSftp;
 import com.jcraft.jsch.JSchException;
 import com.jcraft.jsch.Session;
 
@@ -46,9 +48,19 @@ public class SftpProviderIPv6TestCase extends AbstractSftpProviderTestCase {
 
             Mockito.when(sessionMock.isConnected()).thenReturn(true);
 
+            // The probe of findFile stats the file. The sftp channel answers that the file is not there, so the probe
+            // throws nothing and the test checks the names.
+            final ChannelSftp channelSftpMock = Mockito.mock(ChannelSftp.class);
             try {
                 Mockito.when(sessionMock.openChannel(Mockito.anyString())).thenReturn(channelExecMock);
-            } catch (final JSchException e) {
+                Mockito.when(sessionMock.openChannel("sftp")).thenReturn(channelSftpMock);
+                Mockito.when(channelSftpMock.isConnected()).thenReturn(true);
+                Mockito.when(channelSftpMock.getSession()).thenReturn(sessionMock);
+                Mockito.when(channelSftpMock.stat(Mockito.anyString()))
+                        .thenThrow(new SftpException(ChannelSftp.SSH_FX_NO_SUCH_FILE, "No such file"));
+                Mockito.when(channelSftpMock.lstat(Mockito.anyString()))
+                        .thenThrow(new SftpException(ChannelSftp.SSH_FX_NO_SUCH_FILE, "No such file"));
+            } catch (final JSchException | SftpException e) {
                 throw new AssertionError("Should never happen", e);
             }
 

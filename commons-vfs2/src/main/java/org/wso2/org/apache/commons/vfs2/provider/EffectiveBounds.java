@@ -35,6 +35,10 @@ import org.wso2.org.apache.commons.vfs2.provider.sftp.SftpFileSystemConfigBuilde
  * The factories do not resolve their values themselves. They apply what this class gives, so a value that a caller
  * logs is the value that the code enforces. It makes no remote call and opens no connection.
  * </p>
+ * <p>
+ * A local path has no bound in the JVM. For the scheme {@code file} the object holds no bound, and a mount takes its
+ * bound from the mount options.
+ * </p>
  */
 public final class EffectiveBounds {
 
@@ -112,6 +116,45 @@ public final class EffectiveBounds {
     }
 
     /**
+     * The timeouts that a set of options holds for SMB2. The provider of SMB2 is in another module, which this class
+     * can not name, so its config builder gives them.
+     */
+    public interface Smb2Timeouts {
+
+        /**
+         * Gets the read timeout that the options hold.
+         *
+         * @param options the options, or null for none.
+         * @return the timeout, or null when the options hold none.
+         */
+        Duration configuredReadTimeout(FileSystemOptions options);
+
+        /**
+         * Gets the write timeout that the options hold.
+         *
+         * @param options the options, or null for none.
+         * @return the timeout, or null when the options hold none.
+         */
+        Duration configuredWriteTimeout(FileSystemOptions options);
+
+        /**
+         * Gets the transact timeout that the options hold.
+         *
+         * @param options the options, or null for none.
+         * @return the timeout, or null when the options hold none.
+         */
+        Duration configuredTransactTimeout(FileSystemOptions options);
+
+        /**
+         * Gets the write stall timeout that the options hold.
+         *
+         * @param options the options, or null for none.
+         * @return the timeout, or null when the options hold none.
+         */
+        Duration configuredWriteStallTimeout(FileSystemOptions options);
+    }
+
+    /**
      * The system property of the second step of the SFTP session timeout, in milliseconds.
      */
     public static final String SFTP_TIMEOUT_PROPERTY = "vfs.sftp.timeout.default";
@@ -131,6 +174,22 @@ public final class EffectiveBounds {
     private static final String FTP = "ftp";
 
     private static final String FTPS = "ftps";
+
+    private static final String SMB2 = "smb2";
+
+    private static final String LOCAL = "file";
+
+    // The config builder of the SMB2 provider, in the sandbox module. It is loaded by name, as the manager loads a
+    // provider.
+    private static final String SMB2_BUILDER =
+            "org.wso2.org.apache.commons.vfs2.provider.smb2.Smb2FileSystemConfigBuilder";
+
+    private static final long SMB2_REQUEST_TIMEOUT_MILLIS = 60000;
+
+    // smbj sends no keep alive and takes a socket read timeout as fatal, so the socket timeout stays 0.
+    private static final long SMB2_SOCKET_TIMEOUT_MILLIS = 0;
+
+    private static final long SMB2_CONNECT_TIMEOUT_MILLIS = 5000;
 
     private static final long FTP_CONNECT_TIMEOUT_MILLIS = 30000;
 
@@ -168,14 +227,15 @@ public final class EffectiveBounds {
 
     private final Bound dataTimeout;
 
-    private EffectiveBounds(final String scheme, final Bound connectTimeout, final Bound sessionTimeout,
-            final Bound keepAliveCount, final Bound writeStallTimeout) {
-        this(scheme, connectTimeout, sessionTimeout, keepAliveCount, writeStallTimeout, null, null);
-    }
+    private final Bound readTimeout;
+
+    private final Bound writeTimeout;
+
+    private final Bound transactTimeout;
 
     private EffectiveBounds(final String scheme, final Bound connectTimeout, final Bound sessionTimeout,
             final Bound keepAliveCount, final Bound writeStallTimeout, final Bound socketTimeout,
-            final Bound dataTimeout) {
+            final Bound dataTimeout, final Bound readTimeout, final Bound writeTimeout, final Bound transactTimeout) {
         this.scheme = scheme;
         this.connectTimeout = connectTimeout;
         this.sessionTimeout = sessionTimeout;
@@ -183,6 +243,9 @@ public final class EffectiveBounds {
         this.writeStallTimeout = writeStallTimeout;
         this.socketTimeout = socketTimeout;
         this.dataTimeout = dataTimeout;
+        this.readTimeout = readTimeout;
+        this.writeTimeout = writeTimeout;
+        this.transactTimeout = transactTimeout;
     }
 
     /**
@@ -202,6 +265,12 @@ public final class EffectiveBounds {
         }
         if (FTPS.equals(scheme)) {
             return ftp(FTPS, FtpsFileSystemConfigBuilder.getInstance(), options);
+        }
+        if (SMB2.equals(scheme) && Smb2Lookup.TIMEOUTS != null) {
+            return smb2(Smb2Lookup.TIMEOUTS, options);
+        }
+        if (LOCAL.equals(scheme)) {
+            return new EffectiveBounds(LOCAL, null, null, null, null, null, null, null, null, null);
         }
         throw new IllegalArgumentException("The bounds of the scheme " + scheme + " are not known.");
     }
@@ -233,7 +302,7 @@ public final class EffectiveBounds {
         final Bound writeStall = stall != null ? new Bound(millis(stall), Source.ENDPOINT)
                 : new Bound(WRITE_STALL_TIMEOUT_MILLIS, Source.DEFAULT);
 
-        return new EffectiveBounds(SFTP, connect, session, count, writeStall);
+        return new EffectiveBounds(SFTP, connect, session, count, writeStall, null, null, null, null, null);
     }
 
     // Each value is the endpoint option, else the default. FTP has no system property and no derived value.
@@ -243,7 +312,33 @@ public final class EffectiveBounds {
         final Bound socket = endpointOr(builder.getSoTimeoutDuration(options), FTP_SOCKET_TIMEOUT_MILLIS);
         final Bound data = endpointOr(builder.getDataTimeoutDuration(options), FTP_DATA_TIMEOUT_MILLIS);
         final Bound stall = endpointOr(builder.getWriteStallTimeout(options), WRITE_STALL_TIMEOUT_MILLIS);
-        return new EffectiveBounds(scheme, connect, null, null, stall, socket, data);
+        return new EffectiveBounds(scheme, connect, null, null, stall, socket, data, null, null, null);
+    }
+
+    // Each request timeout is the endpoint option, else the default of smbj. SMB2 has no system property. The socket
+    // timeout and the connect timeout are fixed.
+    private static EffectiveBounds smb2(final Smb2Timeouts timeouts, final FileSystemOptions options) {
+        final Bound read = endpointOr(timeouts.configuredReadTimeout(options), SMB2_REQUEST_TIMEOUT_MILLIS);
+        final Bound write = endpointOr(timeouts.configuredWriteTimeout(options), SMB2_REQUEST_TIMEOUT_MILLIS);
+        final Bound transact = endpointOr(timeouts.configuredTransactTimeout(options), SMB2_REQUEST_TIMEOUT_MILLIS);
+        final Bound stall = endpointOr(timeouts.configuredWriteStallTimeout(options), WRITE_STALL_TIMEOUT_MILLIS);
+        return new EffectiveBounds(SMB2, new Bound(SMB2_CONNECT_TIMEOUT_MILLIS, Source.FIXED), null, null, stall,
+                new Bound(SMB2_SOCKET_TIMEOUT_MILLIS, Source.FIXED), null, read, write, transact);
+    }
+
+    // Loaded the first time a caller asks for smb2. Null when the SMB2 provider is not on the class path.
+    private static final class Smb2Lookup {
+
+        static final Smb2Timeouts TIMEOUTS = load();
+
+        private static Smb2Timeouts load() {
+            try {
+                final Class<?> builder = Class.forName(SMB2_BUILDER, true, EffectiveBounds.class.getClassLoader());
+                return (Smb2Timeouts) builder.getConstructor().newInstance();
+            } catch (final ReflectiveOperationException e) {
+                return null;
+            }
+        }
     }
 
     private static Bound endpointOr(final Duration endpoint, final long defaultMillis) {
@@ -351,6 +446,33 @@ public final class EffectiveBounds {
         return dataTimeout;
     }
 
+    /**
+     * Gets the timeout of each SMB2 read request.
+     *
+     * @return the bound, or null for a scheme that has none.
+     */
+    public Bound getReadTimeout() {
+        return readTimeout;
+    }
+
+    /**
+     * Gets the timeout of each SMB2 write request.
+     *
+     * @return the bound, or null for a scheme that has none.
+     */
+    public Bound getWriteTimeout() {
+        return writeTimeout;
+    }
+
+    /**
+     * Gets the timeout of each other SMB2 request, for example a create, a query or a close.
+     *
+     * @return the bound, or null for a scheme that has none.
+     */
+    public Bound getTransactTimeout() {
+        return transactTimeout;
+    }
+
     @Override
     public boolean equals(final Object other) {
         if (!(other instanceof EffectiveBounds)) {
@@ -361,17 +483,32 @@ public final class EffectiveBounds {
                 && Objects.equals(sessionTimeout, bounds.sessionTimeout)
                 && Objects.equals(keepAliveCount, bounds.keepAliveCount)
                 && Objects.equals(writeStallTimeout, bounds.writeStallTimeout)
-                && Objects.equals(socketTimeout, bounds.socketTimeout) && Objects.equals(dataTimeout, bounds.dataTimeout);
+                && Objects.equals(socketTimeout, bounds.socketTimeout) && Objects.equals(dataTimeout, bounds.dataTimeout)
+                && Objects.equals(readTimeout, bounds.readTimeout) && Objects.equals(writeTimeout, bounds.writeTimeout)
+                && Objects.equals(transactTimeout, bounds.transactTimeout);
     }
 
     @Override
     public int hashCode() {
         return Objects.hash(scheme, connectTimeout, sessionTimeout, keepAliveCount, writeStallTimeout, socketTimeout,
-                dataTimeout);
+                dataTimeout, readTimeout, writeTimeout, transactTimeout);
     }
 
+    /**
+     * Gives the bounds as one line of text, each with its value and its source, for the init log of a component.
+     *
+     * @return the text.
+     */
     @Override
     public String toString() {
+        if (connectTimeout == null) {
+            return scheme + ": the fork enforces no bound. A mount takes its bound from the mount options";
+        }
+        if (readTimeout != null) {
+            return scheme + ": connect timeout " + connectTimeout + ", socket timeout " + socketTimeout
+                    + ", read timeout " + readTimeout + ", write timeout " + writeTimeout + ", transact timeout "
+                    + transactTimeout + ", write stall timeout " + writeStallTimeout;
+        }
         if (socketTimeout != null) {
             return scheme + ": connect timeout " + connectTimeout + ", socket timeout " + socketTimeout
                     + ", data timeout " + dataTimeout + ", write stall timeout " + writeStallTimeout;

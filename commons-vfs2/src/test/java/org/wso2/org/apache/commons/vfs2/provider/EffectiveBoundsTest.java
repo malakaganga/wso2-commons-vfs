@@ -17,6 +17,7 @@
 package org.wso2.org.apache.commons.vfs2.provider;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -230,6 +231,37 @@ public class EffectiveBoundsTest {
 
     @Test
     public void schemeWithNoKnownBoundsIsRefused() {
+        // The SMB2 provider is in the sandbox module, which this module does not have on its class path.
         assertThrows(IllegalArgumentException.class, () -> EffectiveBounds.of("smb2", new FileSystemOptions()));
+        assertThrows(IllegalArgumentException.class, () -> EffectiveBounds.of("ram", new FileSystemOptions()));
+    }
+
+    @Test
+    public void localPathHasNoBound() {
+        final EffectiveBounds local = EffectiveBounds.of("file", new FileSystemOptions());
+        assertEquals("file", local.getScheme());
+        assertNull(local.getConnectTimeout());
+        assertNull(local.getSessionTimeout());
+        assertNull(local.getKeepAliveCount());
+        assertNull(local.getSocketTimeout());
+        assertNull(local.getDataTimeout());
+        assertNull(local.getReadTimeout());
+        assertNull(local.getWriteTimeout());
+        assertNull(local.getTransactTimeout());
+        assertNull(local.getWriteStallTimeout());
+        assertEquals(local, EffectiveBounds.of("file", null));
+        assertEquals("file: the fork enforces no bound. A mount takes its bound from the mount options",
+                local.toString());
+    }
+
+    @Test
+    public void textOfTheInitLineNamesEachBoundWithItsSource() {
+        final FileSystemOptions options = new FileSystemOptions();
+        BUILDER.setSessionTimeout(options, Duration.ofMillis(20000));
+        assertEquals("sftp: connect timeout 20000 from DERIVED, session timeout 20000 from ENDPOINT, keep alive count 1"
+                + " from DERIVED, write stall timeout 60000 from DEFAULT", sftp(options).toString());
+        assertEquals("ftp: connect timeout 30000 from DEFAULT, socket timeout 60000 from DEFAULT, data timeout 60000"
+                + " from DEFAULT, write stall timeout 60000 from DEFAULT",
+                EffectiveBounds.of("ftp", new FileSystemOptions()).toString());
     }
 }

@@ -21,6 +21,7 @@ package org.wso2.org.apache.commons.vfs2.provider.smb2;
 import org.wso2.org.apache.commons.vfs2.FileSystem;
 import org.wso2.org.apache.commons.vfs2.FileSystemConfigBuilder;
 import org.wso2.org.apache.commons.vfs2.FileSystemOptions;
+import org.wso2.org.apache.commons.vfs2.provider.EffectiveBounds;
 
 import java.time.Duration;
 import java.util.ArrayList;
@@ -28,7 +29,7 @@ import java.util.ArrayList;
 /**
  * The config builder for SMB2 configuration options.
  */
-public class Smb2FileSystemConfigBuilder extends FileSystemConfigBuilder {
+public class Smb2FileSystemConfigBuilder extends FileSystemConfigBuilder implements EffectiveBounds.Smb2Timeouts {
 
     private static final Smb2FileSystemConfigBuilder BUILDER = new Smb2FileSystemConfigBuilder();
     private static final String ENCRYPTION_ENABLED = "EncryptionEnabled";
@@ -169,6 +170,26 @@ public class Smb2FileSystemConfigBuilder extends FileSystemConfigBuilder {
      */
     public Duration getWriteStallTimeout(FileSystemOptions opts) {
         return valueOrDefault(opts, WRITE_STALL_TIMEOUT);
+    }
+
+    @Override
+    public Duration configuredReadTimeout(FileSystemOptions opts) {
+        return getParam(opts, READ_TIMEOUT);
+    }
+
+    @Override
+    public Duration configuredWriteTimeout(FileSystemOptions opts) {
+        return getParam(opts, WRITE_TIMEOUT);
+    }
+
+    @Override
+    public Duration configuredTransactTimeout(FileSystemOptions opts) {
+        return getParam(opts, TRANSACT_TIMEOUT);
+    }
+
+    @Override
+    public Duration configuredWriteStallTimeout(FileSystemOptions opts) {
+        return getParam(opts, WRITE_STALL_TIMEOUT);
     }
 
     private Duration valueOrDefault(FileSystemOptions opts, String name) {

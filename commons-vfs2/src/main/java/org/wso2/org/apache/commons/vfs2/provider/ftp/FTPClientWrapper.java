@@ -97,10 +97,24 @@ public class FTPClientWrapper implements FtpClient {
      */
     protected FTPClientWrapper(final GenericFileName rootFileName, final FileSystemOptions fileSystemOptions,
             final Supplier<SocketGroup> socketGroups) throws FileSystemException {
+        this(rootFileName, fileSystemOptions, socketGroups, System.nanoTime());
+    }
+
+    /**
+     * Constructs a new instance whose first connect runs in the fast window of the call that creates it.
+     *
+     * @param rootFileName the root file name.
+     * @param fileSystemOptions the file system options.
+     * @param socketGroups gives the group of each new client, before it connects.
+     * @param windowStart the start of the fast window of the call, on the clock of {@link System#nanoTime()}.
+     * @throws FileSystemException if a file system error occurs.
+     */
+    protected FTPClientWrapper(final GenericFileName rootFileName, final FileSystemOptions fileSystemOptions,
+            final Supplier<SocketGroup> socketGroups, final long windowStart) throws FileSystemException {
         this.rootFileName = rootFileName;
         this.fileSystemOptions = fileSystemOptions;
         this.socketGroups = socketGroups;
-        getFtpClient(System.nanoTime()); // fail-fast
+        getFtpClient(windowStart); // fail-fast
     }
 
     @Override
