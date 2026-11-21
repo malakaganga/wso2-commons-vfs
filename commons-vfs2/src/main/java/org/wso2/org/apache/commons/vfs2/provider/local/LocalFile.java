@@ -23,6 +23,7 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.file.AccessDeniedException;
 import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.DirectoryStream;
 import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
@@ -257,11 +258,7 @@ public class LocalFile extends AbstractFileObject<LocalFileSystem> implements At
      */
     @Override
     protected void doRename(final FileObject newFile) throws Exception {
-        final LocalFile newLocalFile = (LocalFile) FileObjectUtils.getAbstractFileObject(newFile);
-
-        if (!file.renameTo(newLocalFile.getLocalFile())) {
-            throw new FileSystemException("vfs.provider.local/rename-file.error", file.toString(), newFile.toString());
-        }
+        Files.move(pathNow(), pathOf(newFile), StandardCopyOption.ATOMIC_MOVE);
     }
 
     @Override
@@ -316,6 +313,81 @@ public class LocalFile extends AbstractFileObject<LocalFileSystem> implements At
     // The path of this name, as doAttach makes it, with no need of an attached object.
     private Path pathNow() throws FileSystemException {
         return new File(rootFile + getName().getPathDecoded()).toPath();
+    }
+
+    @Override
+    protected boolean isSameEntry(final FileObject other) throws FileSystemException {
+        if (!FileObjectUtils.isInstanceOf(other, LocalFile.class)) {
+            return false;
+        }
+        final Path first = pathNow();
+        final Path second = pathOf(other);
+        if (first.toString().equals(second.toString())) {
+            return true;
+        }
+        if (first.getParent() == null || second.getParent() == null
+                || !first.getFileName().toString().equals(second.getFileName().toString())) {
+            return false;
+        }
+        try {
+            return Files.isSameFile(first.getParent(), second.getParent());
+        } catch (final NoSuchFileException e) {
+            return false;
+        } catch (final IOException e) {
+            throw new FileSystemException(e);
+        }
+    }
+
+    @Override
+    protected boolean isOtherHardLink(final FileObject other) throws FileSystemException {
+        if (!FileObjectUtils.isInstanceOf(other, LocalFile.class)) {
+            return false;
+        }
+        final Path source = pathNow();
+        final Path target = pathOf(other);
+        if (!Files.isRegularFile(source, LinkOption.NOFOLLOW_LINKS)
+                || !Files.isRegularFile(target, LinkOption.NOFOLLOW_LINKS)
+                || !sameExistingFile(source, other)) {
+            return false;
+        }
+        try {
+            if (source.getFileName().toString().equalsIgnoreCase(target.getFileName().toString())
+                    && Files.isSameFile(source.getParent(), target.getParent())) {
+                boolean hasSource = false;
+                boolean hasTarget = false;
+                try (DirectoryStream<Path> entries = Files.newDirectoryStream(source.getParent())) {
+                    for (final Path entry : entries) {
+                        final String name = entry.getFileName().toString();
+                        hasSource |= name.equals(source.getFileName().toString());
+                        hasTarget |= name.equals(target.getFileName().toString());
+                    }
+                }
+                return hasSource && hasTarget;
+            }
+            return true;
+        } catch (final IOException e) {
+            throw new FileSystemException(e);
+        }
+    }
+
+    @Override
+    protected boolean isUnsafeTempFor(final FileObject source, final FileObject target) throws FileSystemException {
+        final Path temp = pathNow();
+        return Files.isSymbolicLink(temp) || super.isUnsafeTempFor(source, target)
+                || sameExistingFile(temp, source) || sameExistingFile(temp, target);
+    }
+
+    private static boolean sameExistingFile(final Path temp, final FileObject other) throws FileSystemException {
+        if (!FileObjectUtils.isInstanceOf(other, LocalFile.class)) {
+            return false;
+        }
+        try {
+            return Files.isSameFile(temp, pathOf(other));
+        } catch (final NoSuchFileException e) {
+            return false;
+        } catch (final IOException e) {
+            throw new FileSystemException(e);
+        }
     }
 
     private static Path pathOf(final FileObject file) throws FileSystemException {

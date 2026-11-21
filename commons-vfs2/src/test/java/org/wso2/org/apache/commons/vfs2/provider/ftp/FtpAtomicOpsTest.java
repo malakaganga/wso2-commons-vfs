@@ -41,6 +41,7 @@ import org.apache.commons.net.ftp.FTPReply;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.wso2.org.apache.commons.vfs2.provider.local.CapabilityClockTest;
 import org.junit.jupiter.api.io.TempDir;
 import org.wso2.org.apache.commons.vfs2.FileObject;
 import org.wso2.org.apache.commons.vfs2.FileSystemException;
@@ -48,6 +49,7 @@ import org.wso2.org.apache.commons.vfs2.FileSystemOptions;
 import org.wso2.org.apache.commons.vfs2.impl.StandardFileSystemManager;
 import org.wso2.org.apache.commons.vfs2.provider.AtomicCapabilities.Answer;
 import org.wso2.org.apache.commons.vfs2.provider.AtomicOps;
+import org.wso2.org.apache.commons.vfs2.provider.MoveFailedException;
 import org.wso2.org.apache.commons.vfs2.provider.AtomicOutcome;
 import org.wso2.org.apache.commons.vfs2.provider.AtomicResult;
 import org.wso2.org.apache.commons.vfs2.provider.Fault;
@@ -599,6 +601,25 @@ public class FtpAtomicOpsTest {
     // 421, and that reply still decides the step.
 
     @Test
+    public void definiteRenameRefusalKeepsItsFaultAfterLostLook() throws Exception {
+        final FileObject source = resolve("/a.csv");
+        final FileObject target = resolve("/d/final.csv");
+        assertTrue(source.exists());
+        source.getParent().isWriteable();
+        server.reply("RNTO", null, 553, 1);
+        server.reply("LIST", "d", 425, 2);
+        final MoveFailedException failure = assertThrows(MoveFailedException.class, () -> source.moveTo(target),
+                () -> commands(0).toString());
+        assertEquals(Fault.APPLICATION, Faults.of(failure));
+        assertTrue(failure.isConnectionLost());
+        assertTrue(failure.getCause().getMessage().contains("553"));
+        assertEquals(1, server.count("RNTO"));
+        assertEquals(0, server.count("STOR"));
+        assertArrayEquals(SMALL, Files.readAllBytes(new File(home,"a.csv").toPath()));
+        assertFalse(new File(home,"d/final.csv").exists());
+    }
+
+    @Test
     public void transportReplyToRnfrOrRntoRetiresTheClient() throws Exception {
         Files.write(new File(home, "t.tmp").toPath(), SMALL);
         Files.write(new File(home, "a.lock").toPath(), SMALL);
@@ -609,6 +630,7 @@ public class FtpAtomicOpsTest {
                         resolve("/.part/pb"));
                 assertEquals(AtomicOutcome.REFUSED, rename.getOutcome(), verb + " " + code);
                 assertTrue(rename.isConnectionLost(), verb + " " + code);
+                assertEquals(Fault.TRANSPORT, rename.getFault());
                 assertTrue(rename.getDetail().contains(String.valueOf(code)), rename.getDetail());
                 final int lost = sessionOf(verb, null);
                 assertTrue(after(verb, null).isEmpty(), verb + " " + code + " " + after(verb, null));
@@ -619,6 +641,7 @@ public class FtpAtomicOpsTest {
                 final AtomicResult take = ops("/a.lock").takeAway(resolve("/a.x1.lock"));
                 assertEquals(AtomicOutcome.REFUSED, take.getOutcome(), verb + " " + code);
                 assertTrue(take.isConnectionLost());
+                assertEquals(Fault.TRANSPORT, take.getFault());
                 assertTrue(after(verb, null).isEmpty(), verb + " " + code + " " + after(verb, null));
                 assertTrue(ops("/a.csv").existsNow());
                 assertTrue(sessionOf("MDTM", "a.csv") != sessionOf(verb, null), verb + " " + code);
@@ -794,5 +817,19 @@ public class FtpAtomicOpsTest {
         assertEquals(1, fileSystem.getOpenClientCount());
         assertTrue(AtomicOps.of(manager.resolveFile(server.uri("ftps", "/a.csv"), options)).existsNow());
         assertEquals(users, server.count("USER"));
+    }
+
+    @Test
+    public void noReplacePersistsAfterAnHour() throws Exception {
+        final FileObject file = resolve("/a.csv");
+        final FtpFileSystem fs = (FtpFileSystem)file.getFileSystem();
+        fs.markNoReplace(file.getName().getParent().getPath());
+        final AtomicOps ops = AtomicOps.of(file);
+        final int calls = server.trace().size();
+        CapabilityClockTest.assertPersistent(() -> {
+            assertEquals(Answer.NO, ops.atomicCapabilities().getExclusivePublish());
+            return ops.atomicCapabilities(file).getReplacingRename();
+        });
+        assertEquals(calls, server.trace().size());
     }
 }

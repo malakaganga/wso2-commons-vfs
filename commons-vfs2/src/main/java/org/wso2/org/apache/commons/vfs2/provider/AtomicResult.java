@@ -30,6 +30,8 @@ public final class AtomicResult {
 
     private final String detail;
 
+    private final Fault fault;
+
     private final List<String> leftovers;
 
     private final boolean connectionLost;
@@ -54,10 +56,22 @@ public final class AtomicResult {
      */
     public AtomicResult(final AtomicOutcome outcome, final String detail, final List<String> leftovers,
             final boolean connectionLost) {
+        this(outcome, detail, leftovers, connectionLost, null);
+    }
+
+    /** Constructs a result with the classified fault of the deciding reply. */
+    public AtomicResult(final AtomicOutcome outcome, final String detail, final List<String> leftovers,
+            final boolean connectionLost, final Fault fault) {
+        this.fault = fault;
         this.outcome = Objects.requireNonNull(outcome, "outcome");
         this.detail = detail;
         this.leftovers = Collections.unmodifiableList(new ArrayList<>(leftovers));
         this.connectionLost = connectionLost;
+    }
+
+    /** Returns the classified fault of the deciding reply, when supplied by the provider. */
+    public Fault getFault() {
+        return fault;
     }
 
     /**

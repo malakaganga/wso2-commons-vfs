@@ -16,6 +16,8 @@
  */
 package org.wso2.org.apache.commons.vfs2.provider.ftp;
 
+import org.wso2.org.apache.commons.vfs2.impl.DefaultFileSystemConfigBuilder;
+import org.wso2.org.apache.commons.vfs2.FileSystemOptions;
 import java.io.FilterInputStream;
 import java.io.FilterOutputStream;
 import java.io.IOException;
@@ -998,6 +1000,7 @@ public class FtpFileObject extends AbstractFileObject<FtpFileSystem> implements 
         private final List<String> leftovers = new ArrayList<>();
 
         private boolean connectionLost;
+        private Fault renameFault;
 
         FtpClient client() throws FileSystemException {
             if (client != null && backRefused) {
@@ -1093,8 +1096,16 @@ public class FtpFileObject extends AbstractFileObject<FtpFileSystem> implements 
             }
         }
 
+        void recordRenameReply(final RenameReplies replies) {
+            final Reply reply = replies.getTo() == null ? replies.getFrom() : replies.getTo();
+            if (!FTPReply.isPositiveCompletion(reply.getCode())) {
+                renameFault = faultOf(reply.getCode(), false);
+            }
+        }
+
         AtomicResult result(final AtomicOutcome outcome, final String detail) {
-            return new AtomicResult(outcome, detail, leftovers, connectionLost);
+            return new AtomicResult(outcome, detail, leftovers, connectionLost,
+                    outcome == AtomicOutcome.REFUSED ? renameFault : null);
         }
 
         // A transport reply to the rename of the call. The command did not run, so nothing changed. The client is
@@ -1146,6 +1157,27 @@ public class FtpFileObject extends AbstractFileObject<FtpFileSystem> implements 
         final ReplaceState state = getAbstractFileSystem().getReplaceState(folder);
         return state == ReplaceState.REPLACES ? Answer.YES
                 : state == ReplaceState.NO_REPLACE ? Answer.NO : Answer.NOT_KNOWN;
+    }
+
+    @Override
+    protected EntryRelation entryRelation(final FileObject other) throws FileSystemException {
+        if (!(other.getFileSystem() instanceof FtpFileSystem)) {
+            return EntryRelation.DISTINCT;
+        }
+        if (getFileSystem() == other.getFileSystem()) {
+            return workingDirectoryEntry(other, false, false, true);
+        }
+        final FileSystemOptions left = getAbstractFileSystem().getClientOptions();
+        final FileSystemOptions right = ((FtpFileSystem) other.getFileSystem()).getClientOptions();
+        final FtpFileSystemConfigBuilder config = FtpFileSystemConfigBuilder.getInstance();
+        final DefaultFileSystemConfigBuilder auth = DefaultFileSystemConfigBuilder.getInstance();
+        final boolean sameLogin = auth.getUserAuthenticator(left) == auth.getUserAuthenticator(right);
+
+        final boolean sameRoute = Objects.equals(config.getProxy(left), config.getProxy(right));
+        return workingDirectoryEntry(other, Boolean.TRUE.equals(config.getUserDirIsRoot(left)),
+                Boolean.TRUE.equals(config.getUserDirIsRoot(right)), sameLogin && sameRoute
+                && Objects.equals(config.getControlEncoding(left), config.getControlEncoding(right))
+                && Objects.equals(config.getAutodetectUtf8(left), config.getAutodetectUtf8(right)));
     }
 
     @Override
@@ -1360,6 +1392,7 @@ public class FtpFileObject extends AbstractFileObject<FtpFileSystem> implements 
             } catch (final IOException e) {
                 throw call.notKnown("replacing rename", e, MovePhase.COMMIT, getName().getPath());
             }
+            call.recordRenameReply(replies);
             if (replies.getTo() == null) {
                 if (isTransport(replies.getFrom())) {
                     return call.refusedByTransport(replies.getFrom());
@@ -1511,6 +1544,7 @@ public class FtpFileObject extends AbstractFileObject<FtpFileSystem> implements 
             } catch (final IOException e) {
                 throw call.notKnown("take away", e, MovePhase.RENAME, null);
             }
+            call.recordRenameReply(replies);
             if (replies.getTo() == null) {
                 if (isTransport(replies.getFrom())) {
                     return call.refusedByTransport(replies.getFrom());

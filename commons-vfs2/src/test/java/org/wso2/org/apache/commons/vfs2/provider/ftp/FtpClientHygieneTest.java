@@ -54,6 +54,9 @@ import org.wso2.org.apache.commons.vfs2.impl.StandardFileSystemManager;
 import org.wso2.org.apache.commons.vfs2.provider.EffectiveBounds;
 import org.wso2.org.apache.commons.vfs2.provider.Fault;
 import org.wso2.org.apache.commons.vfs2.provider.Faults;
+import org.wso2.org.apache.commons.vfs2.provider.MoveFailedException;
+import org.wso2.org.apache.commons.vfs2.provider.MoveOptions;
+import org.wso2.org.apache.commons.vfs2.provider.MovePhase;
 import org.wso2.org.apache.commons.vfs2.util.FileObjectUtils;
 import org.wso2.org.apache.commons.vfs2.util.SocketGroup;
 
@@ -298,7 +301,7 @@ public class FtpClientHygieneTest {
 
         final FileObject target = resolve("/c.txt");
         server.reply("RNTO", null, 553, 1);
-        final FileSystemException rename = assertThrows(FileSystemException.class, () -> file.moveTo(target));
+        final FileSystemException rename = assertThrows(FileSystemException.class, () -> ftp(file).doRename(target));
         assertEquals(Fault.APPLICATION, Faults.of(rename));
         assertTrue(messageHolds(rename, "553"), String.valueOf(rename));
 
@@ -574,6 +577,20 @@ public class FtpClientHygieneTest {
     }
 
     @Test
+    public void publicMoveStagesAfterDefiniteRenameRefusal() throws Exception {
+        final FileObject source = resolve("/small.txt");
+        final FileObject target = resolve("/moved.txt");
+        server.reply("RNTO", null, 553, 1);
+        source.moveTo(target);
+        assertArrayEquals(SMALL, Files.readAllBytes(new File(home, "moved.txt").toPath()));
+        assertFalse(new File(home, "small.txt").exists());
+        assertEquals(1, server.count("RETR", "small.txt"));
+        assertEquals(1, server.count("STOR"));
+        assertTrue(server.trace().stream().anyMatch(line -> line.matches("[0-9]+ STOR /?moved[.]txt[.][0-9a-z]{14}[.]part")));
+        assertEquals(1, server.count("DELE", "small.txt"));
+    }
+
+    @Test
     public void transportReplyToACommandDiscardsTheClientAndIsNotSentAgain() throws Exception {
         final FileObject file = resolve("/a.txt");
         assertTrue(file.exists());
@@ -594,6 +611,13 @@ public class FtpClientHygieneTest {
         final long sent = server.count(command);
         server.reply(command, null, FTPReply.CANNOT_OPEN_DATA_CONNECTION, 1);
         final FileSystemException error = assertThrows(FileSystemException.class, action, command);
+        if ("RNTO".equals(command)) {
+            assertTrue(error instanceof MoveFailedException);
+            final MoveFailedException failure = (MoveFailedException) error;
+            assertEquals(MovePhase.RENAME, failure.getPhase());
+            assertTrue(failure.isConnectionLost());
+            assertFalse(failure.isCommitConfirmed());
+        }
         assertTrue(Faults.isTransport(error), command + " " + error);
         assertTrue(messageHolds(error, "425"), command + " " + error);
         assertEquals(sent + 1, server.count(command), command);
@@ -696,5 +720,27 @@ public class FtpClientHygieneTest {
             }
             Thread.sleep(20);
         }
+    }
+
+    @Test
+    public void timeoutViewsIdentifyTheSameFtpEntryWithoutAnotherCommand() throws Exception {
+        final byte[] previous = "previous target".getBytes(StandardCharsets.UTF_8);
+        Files.write(home.toPath().resolve("a.txt"), previous);
+        final FileSystemOptions changed = new FileSystemOptions();
+        FtpFileSystemConfigBuilder.getInstance().setSoTimeout(changed, Duration.ofSeconds(6));
+        final FtpFileObject source = (FtpFileObject) FileObjectUtils.getAbstractFileObject(resolve("/small.txt"));
+        final FileObject alias = resolve("/small.txt", changed);
+        final FileObject destination = resolve("/a.txt", changed);
+        final int baseline = server.trace().size();
+        assertEquals("SAME", String.valueOf(source.entryRelation(alias)));
+        assertEquals("DISTINCT", String.valueOf(source.entryRelation(destination)));
+        assertEquals(baseline, server.trace().size());
+        source.moveTo(alias);
+        assertTrue(assertThrows(MoveFailedException.class,
+                () -> source.moveTo(alias, new MoveOptions(false, null, null, null, null))).isTargetExists());
+        assertThrows(MoveFailedException.class, () -> source.moveTo(destination, alias));
+        assertThrows(MoveFailedException.class, () -> source.moveTo(destination, destination));
+        assertArrayEquals(SMALL, Files.readAllBytes(home.toPath().resolve("small.txt")));
+        assertArrayEquals(previous, Files.readAllBytes(home.toPath().resolve("a.txt")));
     }
 }

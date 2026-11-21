@@ -16,6 +16,9 @@
  */
 package org.wso2.org.apache.commons.vfs2.provider.sftp;
 
+import org.wso2.org.apache.commons.vfs2.impl.DefaultFileSystemConfigBuilder;
+import org.wso2.org.apache.commons.vfs2.FileSystemOptions;
+import java.util.Objects;
 import java.io.ByteArrayInputStream;
 import java.io.FilterInputStream;
 import java.io.FilterOutputStream;
@@ -1055,6 +1058,34 @@ public class SftpFileObject extends AbstractFileObject<SftpFileSystem> implement
         final ReplaceState state = getAbstractFileSystem().getReplaceState(folder);
         return state == ReplaceState.REPLACES ? Answer.YES
                 : state == ReplaceState.NO_REPLACE ? Answer.NO : Answer.NOT_KNOWN;
+    }
+
+    @Override
+    protected EntryRelation entryRelation(final FileObject other) throws FileSystemException {
+        if (!(other.getFileSystem() instanceof SftpFileSystem)) {
+            return EntryRelation.DISTINCT;
+        }
+        if (getFileSystem() == other.getFileSystem()) {
+            return workingDirectoryEntry(other, false, false, true);
+        }
+        final FileSystemOptions left = getFileSystem().getFileSystemOptions();
+        final FileSystemOptions right = other.getFileSystem().getFileSystemOptions();
+        final SftpFileSystemConfigBuilder config = SftpFileSystemConfigBuilder.getInstance();
+        final DefaultFileSystemConfigBuilder auth = DefaultFileSystemConfigBuilder.getInstance();
+        final boolean sameLogin = auth.getUserAuthenticator(left) == auth.getUserAuthenticator(right);
+
+        final boolean sameRoute = Objects.equals(config.getProxyHost(left), config.getProxyHost(right))
+                && config.getProxyPort(left) == config.getProxyPort(right)
+                && config.getProxyType(left) == config.getProxyType(right)
+                && Objects.equals(config.getProxyUser(left), config.getProxyUser(right))
+                && config.getProxyUserAuthenticator(left) == config.getProxyUserAuthenticator(right)
+                && config.getProxyOptions(left) == config.getProxyOptions(right)
+                && Objects.equals(config.getProxyCommand(left), config.getProxyCommand(right))
+                && config.getConfigRepository(left) == config.getConfigRepository(right)
+                && config.isLoadOpenSSHConfig(left) == config.isLoadOpenSSHConfig(right);
+        return workingDirectoryEntry(other, Boolean.TRUE.equals(config.getUserDirIsRoot(left)),
+                Boolean.TRUE.equals(config.getUserDirIsRoot(right)), sameLogin && sameRoute
+                && Objects.equals(config.getFileNameEncoding(left), config.getFileNameEncoding(right)));
     }
 
     @Override

@@ -31,6 +31,7 @@ import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
@@ -58,6 +59,11 @@ import com.hierynomus.smbj.share.File;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.function.Executable;
+import org.wso2.org.apache.commons.vfs2.FileName;
+import org.wso2.org.apache.commons.vfs2.FileSystemOptions;
+import org.wso2.org.apache.commons.vfs2.provider.AbstractFileName;
+import org.wso2.org.apache.commons.vfs2.provider.MoveFailedException;
+import org.wso2.org.apache.commons.vfs2.provider.MoveOptions;
 import org.wso2.org.apache.commons.vfs2.FileSystemException;
 import org.wso2.org.apache.commons.vfs2.FileType;
 import org.wso2.org.apache.commons.vfs2.provider.AtomicCapabilities.Answer;
@@ -589,5 +595,40 @@ public class Smb2AtomicOpsTest {
         client.metadataOpenFails(status(NtStatus.STATUS_OBJECT_NAME_NOT_FOUND));
         assertFalse(file("in/a.csv").statNow().isThere());
         assertFalse(file("in").folderExistsNow());
+    }
+
+    @Test
+    public void caseOnlyDirectRenameAndStagingGuardsRespectTheShare() throws Exception {
+        Smb2FileObject source = spy(file("in/Name"));
+        Smb2FileObject otherCase = file("in/name");
+        Smb2FileObject temp = file("in/stage");
+        MoveOptions options = new MoveOptions(true, temp, null, null, null);
+        assertEquals("UNKNOWN", String.valueOf(source.entryRelation(otherCase)));
+        assertEquals("DISTINCT", String.valueOf(source.entryRelation(temp)));
+        String compact = Smb2Doubles.ROOT.replace("127.0.0.1", "127.1");
+        Smb2FileNameParser parser = Smb2FileNameParser.getInstance();
+        FileName aliasRoot = parser.parseUri(null, null, compact);
+        Smb2FileSystem aliasView = new Smb2FileSystem(aliasRoot, new FileSystemOptions(), new Factory(spare.wrapper));
+        AbstractFileName aliasName = (AbstractFileName) parser.parseUri(null, null, compact + "in/Name");
+        assertEquals("SAME", String.valueOf(source.entryRelation(new Smb2FileObject(aliasName, aliasView, aliasRoot))));
+        FileName otherRoot = Smb2FileNameParser.getInstance().parseUri(null, null,
+                Smb2Doubles.ROOT.replace("/data/", "/archive/"));
+        Smb2FileSystem otherShare = new Smb2FileSystem(otherRoot, new FileSystemOptions(),
+                new Factory(spare.wrapper));
+        assertEquals("DISTINCT", String.valueOf(source.entryRelation(new Smb2FileObject(Smb2Doubles.name("in/Name"),
+                otherShare, otherRoot))));
+        doReturn(null).when(source).getParent();
+        doReturn(FileType.FILE).when(source).getType();
+        doReturn(new AtomicResult(AtomicOutcome.DONE, null)).when(source).renameReplacing(eq(otherCase), any(), any());
+        source.moveTo(otherCase, options);
+        verify(source).renameReplacing(eq(otherCase), any(), any());
+        for (AtomicOutcome outcome : new AtomicOutcome[] {AtomicOutcome.REFUSED, AtomicOutcome.UNSUPPORTED}) {
+            doReturn(new AtomicResult(outcome, null)).when(source).renameReplacing(eq(otherCase), any(), any());
+            MoveFailedException e = assertThrows(MoveFailedException.class, () -> source.moveTo(otherCase, options));
+            assertFalse(e.isTargetExists());
+            assertFalse(e.isCommitConfirmed());
+        }
+        verify(source, never()).getContent();
+        verify(source, never()).takeAway(any());
     }
 }

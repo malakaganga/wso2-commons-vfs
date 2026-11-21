@@ -38,6 +38,9 @@ import java.io.InputStream;
 import java.io.InterruptedIOException;
 import java.lang.reflect.Field;
 import java.net.SocketTimeoutException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -47,8 +50,17 @@ import java.util.UUID;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import org.wso2.org.apache.commons.vfs2.provider.local.CapabilityClockTest;
 import org.junit.jupiter.api.function.Executable;
 import org.mockito.InOrder;
+import org.wso2.org.apache.commons.vfs2.FileObject;
+import org.wso2.org.apache.commons.vfs2.auth.StaticUserAuthenticator;
+import org.wso2.org.apache.commons.vfs2.impl.DefaultFileSystemConfigBuilder;
+import org.wso2.org.apache.commons.vfs2.impl.DecoratedFileObject;
+import org.wso2.org.apache.commons.vfs2.impl.StandardFileSystemManager;
+import org.wso2.org.apache.commons.vfs2.provider.MoveFailedException;
+import org.wso2.org.apache.commons.vfs2.provider.MoveOptions;
+import org.wso2.org.apache.commons.vfs2.util.FileObjectUtils;
 import org.wso2.org.apache.commons.vfs2.FileSystemException;
 import org.wso2.org.apache.commons.vfs2.FileSystemOptions;
 import org.wso2.org.apache.commons.vfs2.FileType;
@@ -989,6 +1001,67 @@ public class SftpAtomicOpsTest {
         final SftpFileObject object = file(fileSystem, in, "t.csv");
         for (final long second : seconds) {
             assertEquals(second * 1000, object.statNow().getLastModifiedMillis());
+        }
+    }
+
+    @Test
+    public void noLinkPersistsAfterAnHour() throws Exception {
+        final Channels fs = new Channels();
+        fs.announced(true, false);
+        final SftpFileObject file = file(fs, in, "a.csv");
+        fs.markNoLink(file.getName().getParent().getPath());
+        CapabilityClockTest.assertPersistent(() -> file.atomicCapabilities().getExclusiveCreate());
+        assertTrue(fs.putBack.isEmpty());
+        assertTrue(fs.discarded.isEmpty());
+    }
+
+    @Test
+    public void sftpViewsProtectBothBusinessEntriesAndAllowAnotherEndpoint() throws Exception {
+        try (SftpTestServer one = new SftpTestServer(); SftpTestServer two = new SftpTestServer();
+                StandardFileSystemManager manager = new StandardFileSystemManager()) {
+            manager.init();
+            FileSystemOptions options = SftpTestServer.options();
+            SftpFileSystemConfigBuilder config = SftpFileSystemConfigBuilder.getInstance();
+            config.setAvoidPermissionCheck(options, "true");
+            FileSystemOptions changed = (FileSystemOptions) options.clone();
+            config.setSessionTimeout(changed, Duration.ofSeconds(8));
+            Path src = one.write("in/source", "source");
+            Path dst = one.write("in/dest", "old target");
+            SftpFileObject source = (SftpFileObject) FileObjectUtils.getAbstractFileObject(
+                    manager.resolveFile(one.uri("in/source"), options));
+            FileObject alias = new DecoratedFileObject(manager.resolveFile(one.uri("in/source"), changed));
+            FileObject target = manager.resolveFile(one.uri("in/dest"), changed);
+            assertEquals("SAME", String.valueOf(source.entryRelation(alias)));
+            source.moveTo(alias);
+            assertTrue(assertThrows(MoveFailedException.class, () -> source.moveTo(alias,
+                    new MoveOptions(false, null, null, null, null))).isTargetExists());
+            for (FileObject temp : new FileObject[] {alias, new DecoratedFileObject(target)}) {
+                assertThrows(MoveFailedException.class, () -> source.moveTo(target, temp));
+                assertEquals("source", Files.readString(src));
+                assertEquals("old target", Files.readString(dst));
+            }
+            FileSystemOptions opaque = (FileSystemOptions) changed.clone();
+            DefaultFileSystemConfigBuilder.getInstance().setUserAuthenticator(opaque,
+                    new StaticUserAuthenticator(null, SftpTestServer.USER, SftpTestServer.USER));
+            FileObject overlap = manager.resolveFile(one.uri("in/source"), opaque);
+            assertEquals("UNKNOWN", String.valueOf(source.entryRelation(overlap)));
+            assertFalse(assertThrows(MoveFailedException.class, () -> source.moveTo(overlap)).isTargetExists());
+            assertEquals("DISTINCT", String.valueOf(source.entryRelation(manager.resolveFile(one.uri("in/dest"), opaque))));
+            FileObject opaqueDest = manager.resolveFile(one.uri("in/dest"), opaque);
+            assertFalse(assertThrows(MoveFailedException.class, () -> source.moveTo(opaqueDest, overlap)).isTargetExists());
+            assertEquals("source", Files.readString(src));
+            assertEquals("old target", Files.readString(dst));
+            Path unrelated = one.write("in/unrelated", "different bytes");
+            manager.resolveFile(one.uri("in/unrelated"), options).moveTo(opaqueDest);
+            assertFalse(Files.exists(unrelated));
+            assertEquals("different bytes", Files.readString(dst));
+            Path separate = two.write("in/source", "separate");
+            FileObject different = manager.resolveFile(two.uri("in/source"), changed);
+            assertEquals("DISTINCT", String.valueOf(source.entryRelation(different)));
+            source.moveTo(different);
+            assertEquals("source", Files.readString(separate));
+            assertFalse(Files.exists(src));
+            assertEquals("different bytes", Files.readString(dst));
         }
     }
 }

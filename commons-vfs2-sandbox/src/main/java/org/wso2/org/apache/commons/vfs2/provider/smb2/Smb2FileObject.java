@@ -543,6 +543,19 @@ public class Smb2FileObject extends AbstractFileObject<Smb2FileSystem> implement
     }
 
     @Override
+    protected EntryRelation entryRelation(final FileObject other) throws FileSystemException {
+        if (!(other.getFileSystem() instanceof Smb2FileSystem)) {
+            return EntryRelation.DISTINCT;
+        }
+        final Smb2FileName a = (Smb2FileName) getFileSystem().getRootName();
+        final Smb2FileName b = (Smb2FileName) other.getFileSystem().getRootName();
+        if (!a.getShareName().equalsIgnoreCase(b.getShareName())) {
+            return EntryRelation.DISTINCT;
+        }
+        return remoteEntry(other, true, true);
+    }
+
+    @Override
     public AtomicCapabilities atomicCapabilities() {
         return new AtomicCapabilities(Answer.YES, publishAnswer(pairKey(getName(), getName())), Answer.YES);
     }
