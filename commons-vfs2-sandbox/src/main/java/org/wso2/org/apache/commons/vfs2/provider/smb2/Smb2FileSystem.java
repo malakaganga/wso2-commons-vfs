@@ -35,6 +35,8 @@ import org.wso2.org.apache.commons.vfs2.util.TestPoints;
 import java.util.Collection;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
 public class Smb2FileSystem extends AbstractFileSystem {
@@ -50,6 +52,19 @@ public class Smb2FileSystem extends AbstractFileSystem {
     private static final Log LOG = LogFactory.getLog(Smb2FileSystem.class);
 
     private final Smb2WrapperClientFactory clientWrapperFactory;
+
+    // How long a folder pair stays "no link" after a refused link.
+    static final long NO_LINK_NANOS = TimeUnit.MINUTES.toNanos(10);
+
+    // The value LINKS of a folder pair. Any other value is the end of a "no link" mark on the monotonic clock.
+    private static final Long LINKS = Long.MIN_VALUE;
+
+    // The link state per folder pair, the source folder and the target folder. A pair that is not in the map is not
+    // known. A pair that linked once keeps LINKS.
+    private final ConcurrentMap<String, Long> linkMarks = new ConcurrentHashMap<>();
+
+    // The folder pairs that got their one WARN.
+    private final Set<String> warnedPairs = ConcurrentHashMap.newKeySet();
 
     protected Smb2FileSystem(FileName rootName, FileSystemOptions fileSystemOptions, Smb2WrapperClientFactory wrapperClientFactory) throws FileSystemException {
 
@@ -186,6 +201,27 @@ public class Smb2FileSystem extends AbstractFileSystem {
      * Closes the sockets of the idle client and of every client that is out. It sends no request and takes no
      * monitor, so any thread may call it.
      */
+    boolean isLinked(final String pair) {
+        return LINKS.equals(linkMarks.get(pair));
+    }
+
+    // True while the "no link" mark of the pair holds at the given time.
+    boolean isMarkedNoLink(final String pair, final long nowNanos) {
+        final Long end = linkMarks.get(pair);
+        return end != null && !LINKS.equals(end) && end - nowNanos > 0;
+    }
+
+    void markLinks(final String pair) {
+        linkMarks.put(pair, LINKS);
+    }
+
+    // Marks the pair "no link" for 10 minutes from the given time. A pair that links keeps that state. True only for
+    // the first mark of the pair, which logs the one WARN.
+    boolean markNoLink(final String pair, final long nowNanos) {
+        linkMarks.compute(pair, (key, old) -> LINKS.equals(old) ? old : nowNanos + NO_LINK_NANOS);
+        return !isLinked(pair) && warnedPairs.add(pair);
+    }
+
     @Override
     public void abort() {
         for (final Smb2ClientWrapper wrapper : clients) {

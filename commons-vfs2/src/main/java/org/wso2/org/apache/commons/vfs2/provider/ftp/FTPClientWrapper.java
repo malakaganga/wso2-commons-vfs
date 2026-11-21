@@ -25,6 +25,8 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.function.Supplier;
 
+import org.apache.commons.net.ProtocolCommandEvent;
+import org.apache.commons.net.ProtocolCommandListener;
 import org.apache.commons.net.ftp.FTPClient;
 import org.apache.commons.net.ftp.FTPFile;
 import org.apache.commons.net.ftp.FTPReply;
@@ -352,6 +354,80 @@ public class FTPClientWrapper implements FtpClient {
     }
 
     @Override
+    public Change enterAndBack(final String relPath) throws IOException {
+        return read(client -> {
+            final String first = client.printWorkingDirectory();
+            checkTransportReply(client, "vfs.provider.ftp/change-reply.error", relPath);
+            final boolean entered = client.changeWorkingDirectory(relPath == null ? "." : relPath);
+            final Reply reply = replyOf(client);
+            if (!entered) {
+                checkTransportReply(client, "vfs.provider.ftp/change-reply.error", relPath);
+                return new Change(reply, false, false);
+            }
+            final boolean back = client.changeWorkingDirectory(first);
+            if (!back) {
+                checkTransportReply(client, "vfs.provider.ftp/change-reply.error", relPath);
+            }
+            return new Change(reply, true, !back);
+        });
+    }
+
+    @Override
+    public Listing listChecked(final String relPath, final boolean hidden) throws IOException {
+        return read(client -> {
+            final boolean before = client.getListHiddenFiles();
+            client.setListHiddenFiles(hidden);
+            try {
+                return listCheckedOn(client, relPath);
+            } finally {
+                client.setListHiddenFiles(before);
+            }
+        });
+    }
+
+    // commons net gives an empty list for a refused listing and drops the final reply, so the reply is read here.
+    private static Listing listCheckedOn(final FTPClient client, final String relPath) throws IOException {
+        final FTPFile[] entries = client.listFiles(relPath);
+        if (isListed(client.getReplyCode())) {
+            return new Listing(entries, null, false, false);
+        }
+        // A transport reply ends the listing on this client. The second form is for a refusal only.
+        checkTransportReply(client, relPath);
+        // VFS-307: a server that can not list a path with a blank in it lists the folder after a change into it.
+        String first = null;
+        if (relPath != null) {
+            first = client.printWorkingDirectory();
+            checkTransportReply(client, relPath);
+            if (!client.changeWorkingDirectory(relPath)) {
+                checkTransportReply(client, relPath);
+                return new Listing(null, null, false, false);
+            }
+        }
+        final FTPFile[] second = client.listFiles();
+        final Reply reply = replyOf(client);
+        checkTransportReply(client, relPath);
+        boolean backRefused = false;
+        if (relPath != null && !client.changeWorkingDirectory(first)) {
+            checkTransportReply(client, relPath);
+            backRefused = true;
+        }
+        if (isListed(reply.getCode())) {
+            return new Listing(second, null, relPath != null, backRefused);
+        }
+        return new Listing(null, reply, false, backRefused);
+    }
+
+    // 226 and 250 are the two codes that end a transfer in RFC 959.
+    private static boolean isListed(final int reply) {
+        return reply == FTPReply.CLOSING_DATA_CONNECTION || reply == FTPReply.FILE_ACTION_OK;
+    }
+
+    private static Reply replyOf(final FTPClient client) {
+        final String text = client.getReplyString();
+        return new Reply(client.getReplyCode(), text == null ? "" : text.trim());
+    }
+
+    @Override
     public boolean makeDirectory(final String relPath) throws IOException {
         return change(client -> client.makeDirectory(relPath));
     }
@@ -373,6 +449,16 @@ public class FTPClientWrapper implements FtpClient {
     }
 
     @Override
+    public Reply mdtmReply(final String relPath) throws IOException {
+        return read(client -> {
+            final String time = client.getModificationTime(relPath);
+            checkTransportReply(client, "vfs.provider.ftp/time-reply.error", relPath);
+            final int code = client.getReplyCode();
+            return code == FTPReply.FILE_STATUS && time != null ? new Reply(code, time) : replyOf(client);
+        });
+    }
+
+    @Override
     public boolean removeDirectory(final String relPath) throws IOException {
         return change(client -> client.removeDirectory(relPath));
     }
@@ -380,6 +466,61 @@ public class FTPClientWrapper implements FtpClient {
     @Override
     public boolean rename(final String oldName, final String newName) throws IOException {
         return change(client -> client.rename(oldName, newName));
+    }
+
+    @Override
+    public RenameReplies renameSteps(final String from, final String to) throws IOException {
+        return change(client -> {
+            final ReplyWatch watch = new ReplyWatch();
+            client.addProtocolCommandListener(watch);
+            try {
+                final Reply fromReply = step(client, watch, () -> client.rnfr(from));
+                if (!FTPReply.isPositiveIntermediate(fromReply.getCode())) {
+                    return new RenameReplies(fromReply, null);
+                }
+                return new RenameReplies(fromReply, step(client, watch, () -> client.rnto(to)));
+            } finally {
+                client.removeProtocolCommandListener(watch);
+            }
+        });
+    }
+
+    private interface Send {
+        void run() throws IOException;
+    }
+
+    // One step of a rename. commons net throws when it reads a reply 421, after it has reported that reply. A 421 that
+    // came for this command is the reply of the step, and the caller retires the client. An error with no reply for
+    // this command leaves the step with that error, and the rename may have worked. An older reply decides nothing.
+    private static Reply step(final FTPClient client, final ReplyWatch watch, final Send send) throws IOException {
+        watch.reply = null;
+        try {
+            send.run();
+        } catch (final IOException e) {
+            final Reply came = watch.reply;
+            if (came != null && came.getCode() == FTPReply.SERVICE_NOT_AVAILABLE) {
+                return came;
+            }
+            throw e;
+        }
+        return replyOf(client);
+    }
+
+    // The reply that the client reported after the watch was cleared.
+    private static final class ReplyWatch implements ProtocolCommandListener {
+
+        private Reply reply;
+
+        @Override
+        public void protocolCommandSent(final ProtocolCommandEvent event) {
+            // Only the reply counts.
+        }
+
+        @Override
+        public void protocolReplyReceived(final ProtocolCommandEvent event) {
+            final String text = event.getMessage();
+            reply = new Reply(event.getReplyCode(), text == null ? "" : text.trim());
+        }
     }
 
     @Override
@@ -406,6 +547,16 @@ public class FTPClientWrapper implements FtpClient {
     @Override
     public void setBufferSize(final int bufferSize) throws FileSystemException {
         getFtpClient(System.nanoTime()).setBufferSize(bufferSize);
+    }
+
+    @Override
+    public Reply sizeReply(final String relPath) throws IOException {
+        return read(client -> {
+            final String size = client.getSize(relPath);
+            checkTransportReply(client, "vfs.provider.ftp/size-reply.error", relPath);
+            final int code = client.getReplyCode();
+            return code == FTPReply.FILE_STATUS && size != null ? new Reply(code, size) : replyOf(client);
+        });
     }
 
     @Override

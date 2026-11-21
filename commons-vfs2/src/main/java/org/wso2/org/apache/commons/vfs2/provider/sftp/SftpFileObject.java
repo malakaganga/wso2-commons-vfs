@@ -16,17 +16,24 @@
  */
 package org.wso2.org.apache.commons.vfs2.provider.sftp;
 
+import java.io.ByteArrayInputStream;
 import java.io.FilterInputStream;
 import java.io.FilterOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.InterruptedIOException;
 import java.io.OutputStream;
+import java.net.SocketTimeoutException;
+import java.nio.channels.ClosedByInterruptException;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Vector;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
+import org.wso2.org.apache.commons.vfs2.FileName;
 import org.wso2.org.apache.commons.vfs2.FileNotFoundException;
 import org.wso2.org.apache.commons.vfs2.FileObject;
 import org.wso2.org.apache.commons.vfs2.FileSystemException;
@@ -36,13 +43,26 @@ import org.wso2.org.apache.commons.vfs2.RandomAccessContent;
 import org.wso2.org.apache.commons.vfs2.VFS;
 import org.wso2.org.apache.commons.vfs2.provider.AbstractFileName;
 import org.wso2.org.apache.commons.vfs2.provider.AbstractFileObject;
+import org.wso2.org.apache.commons.vfs2.provider.AtomicCapabilities;
+import org.wso2.org.apache.commons.vfs2.provider.AtomicCapabilities.Answer;
+import org.wso2.org.apache.commons.vfs2.provider.AtomicOps;
+import org.wso2.org.apache.commons.vfs2.provider.AtomicOutcome;
+import org.wso2.org.apache.commons.vfs2.provider.AtomicResult;
+import org.wso2.org.apache.commons.vfs2.provider.Fault;
 import org.wso2.org.apache.commons.vfs2.provider.Faults;
+import org.wso2.org.apache.commons.vfs2.provider.GenericFileName;
+import org.wso2.org.apache.commons.vfs2.provider.MovePhase;
+import org.wso2.org.apache.commons.vfs2.provider.StatNow;
+import org.wso2.org.apache.commons.vfs2.provider.UnclearResultException;
 import org.wso2.org.apache.commons.vfs2.provider.UriParser;
+import org.wso2.org.apache.commons.vfs2.provider.sftp.SftpFileSystem.LinkState;
+import org.wso2.org.apache.commons.vfs2.provider.sftp.SftpFileSystem.ReplaceState;
 import org.wso2.org.apache.commons.vfs2.util.FileObjectUtils;
 import org.wso2.org.apache.commons.vfs2.util.MonitorInputStream;
 import org.wso2.org.apache.commons.vfs2.util.MonitorOutputStream;
 import org.wso2.org.apache.commons.vfs2.util.PosixPermissions;
 import org.wso2.org.apache.commons.vfs2.util.RandomAccessMode;
+import org.wso2.org.apache.commons.vfs2.util.TestPoints;
 
 import com.jcraft.jsch.ChannelSftp;
 import com.jcraft.jsch.ChannelSftp.LsEntry;
@@ -52,7 +72,7 @@ import com.jcraft.jsch.SftpException;
 /**
  * An SFTP file.
  */
-public class SftpFileObject extends AbstractFileObject<SftpFileSystem> {
+public class SftpFileObject extends AbstractFileObject<SftpFileSystem> implements AtomicOps {
     private static final Log LOG = LogFactory.getLog(SftpFileObject.class);
 
     /**
@@ -817,6 +837,600 @@ public class SftpFileObject extends AbstractFileObject<SftpFileSystem> {
             throw error;
         }
         release(channel, null);
+    }
+
+    // The few bytes of a probe file of the replace test.
+    private static final byte[] PROBE_CONTENT = "probe".getBytes(StandardCharsets.US_ASCII);
+
+    // One call of AtomicOps on one channel. A channel whose call ended with no reply of the server is discarded at
+    // once and never used again, so the look and the probe run only on a channel whose calls all got a reply.
+    private final class AtomicCall {
+
+        // The phase of the public call, which an unconfirmed change reports, and its temp path or null. The temp
+        // path is the path of the name in the file system.
+        private final MovePhase phase;
+
+        private String tempPath;
+
+        private ChannelSftp channel;
+
+        private final List<String> leftovers = new ArrayList<>();
+
+        private boolean connectionLost;
+
+        // The message of an interrupt seen before the call sent a change, and its values.
+        private final String code;
+
+        private final Object[] info;
+
+        AtomicCall(final MovePhase phase, final String tempPath, final String code, final Object... info)
+                throws FileSystemException {
+            this.phase = phase;
+            this.tempPath = tempPath;
+            this.code = code;
+            this.info = info;
+            // A pending interrupt stops the call before it takes a channel.
+            if (interrupted()) {
+                throw notSent();
+            }
+            try {
+                channel = getAbstractFileSystem().getChannel();
+            } catch (final FileSystemException e) {
+                throw e;
+            } catch (final IOException e) {
+                throw new FileSystemException(e);
+            }
+        }
+
+        boolean isAnnounced(final String extension) {
+            return SftpFileSystem.ANNOUNCED.equals(channel.getExtension(extension));
+        }
+
+        void discard() {
+            if (channel != null) {
+                getAbstractFileSystem().discardChannel(channel);
+                channel = null;
+            }
+        }
+
+        // The channel goes back only when every call on it got a reply of the server.
+        void end() {
+            if (channel != null) {
+                release(channel, null);
+                channel = null;
+            }
+        }
+
+        // True when the thread was interrupted. No further command is sent then.
+        boolean interrupted() {
+            return Thread.currentThread().isInterrupted();
+        }
+
+        // The check before the first change of the call. After an interrupt nothing is sent, the channel is discarded
+        // and the call ends with a plain error that keeps the interrupt flag.
+        void beforeFirst() throws FileSystemException {
+            if (interrupted()) {
+                discard();
+                throw notSent();
+            }
+        }
+
+        // An interrupt seen before the call sent a change. Nothing changed, so the error is not unclear. Its fault is
+        // the fault of an interrupt.
+        FileSystemException notSent() {
+            final InterruptedIOException cause = new InterruptedIOException(
+                    "The thread was interrupted before the call sent a change.");
+            final FileSystemException error = new FileSystemException(code, cause, info);
+            error.setFault(Faults.of(cause));
+            return error;
+        }
+
+        // Removes a name. A name that the server could not remove is a leftover. No such file means that it is gone.
+        // After an interrupt nothing is sent: the name is a leftover and the channel is discarded.
+        void remove(final String path) {
+            if (channel == null) {
+                leftovers.add(path);
+                return;
+            }
+            if (interrupted()) {
+                discard();
+                connectionLost = true;
+                leftovers.add(path);
+                return;
+            }
+            try {
+                channel.rm(path);
+            } catch (final Exception e) {
+                if (!isReply(e)) {
+                    discard();
+                    // A cancel in the cause chain stays on the thread, also when JSch cleared the flag.
+                    keepInterrupt(e);
+                    connectionLost = true;
+                    leftovers.add(path);
+                } else if (((SftpException) e).id != ChannelSftp.SSH_FX_NO_SUCH_FILE) {
+                    leftovers.add(path);
+                }
+            }
+        }
+
+        AtomicResult result(final AtomicOutcome outcome, final String detail) {
+            return new AtomicResult(outcome, detail, leftovers, connectionLost);
+        }
+
+        // A change whose outcome no reply of the server confirmed. The channel is discarded before the error leaves,
+        // and no further call is made.
+        UnclearResultException notKnown(final String step, final Throwable cause) {
+            discard();
+            keepInterrupt(cause);
+            return new UnclearResultException("vfs.provider/atomic-not-known.error", cause, phase, tempPath, false,
+                    step, getName().getFriendlyURI());
+        }
+
+        // The cause of an interrupt that the fork saw at the handoff to the next command.
+        UnclearResultException interruptedBefore(final String step) {
+            return notKnown(step, new InterruptedIOException("The thread was interrupted before the " + step + "."));
+        }
+    }
+
+    // A cancel that the fork saw in the cause chain stays on the thread, also when JSch cleared the flag. A timeout of
+    // a socket is no cancel.
+    private static void keepInterrupt(final Throwable cause) {
+        for (Throwable link = cause; link != null; link = link.getCause()) {
+            if (link instanceof InterruptedException || link instanceof ClosedByInterruptException
+                    || link instanceof InterruptedIOException && !(link instanceof SocketTimeoutException)) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+            if (link.getCause() == link) {
+                return;
+            }
+        }
+    }
+
+    // A status reply of the server: an SftpException with no cause, on a thread that was not interrupted.
+    private static boolean isReply(final Throwable error) {
+        return error instanceof SftpException && error.getCause() == null
+                && !Thread.currentThread().isInterrupted();
+    }
+
+    private static boolean isNoSuchFile(final Throwable reply) {
+        return ((SftpException) reply).id == ChannelSftp.SSH_FX_NO_SUCH_FILE;
+    }
+
+    private static String detail(final Throwable reply) {
+        return reply instanceof SftpException ? "id " + ((SftpException) reply).id + " " + reply.getMessage()
+                : String.valueOf(reply);
+    }
+
+    private static SftpFileObject sftpOf(final FileObject file) throws FileSystemException {
+        return (SftpFileObject) FileObjectUtils.getAbstractFileObject(file);
+    }
+
+    // The path of a base name in the folder of a path, as JSch takes it.
+    private static String sibling(final String path, final String baseName) {
+        final int slash = path.lastIndexOf('/');
+        return slash < 0 ? baseName : path.substring(0, slash + 1) + baseName;
+    }
+
+    // The folder of a name. A root has no parent, so it is its own folder.
+    private static String folderKey(final FileName name) {
+        final FileName parent = name.getParent();
+        return (parent == null ? name : parent).getPath();
+    }
+
+    private static String pairKey(final FileName source, final FileName target) {
+        return folderKey(source) + "\u0000" + folderKey(target);
+    }
+
+    // The file URI of a test point: no user part and no query.
+    private static String pointKey(final FileName name) {
+        final GenericFileName root = (GenericFileName) name.getRoot();
+        final StringBuilder key = new StringBuilder(root.getScheme()).append("://").append(root.getHostName());
+        if (root.getPort() != root.getDefaultPort()) {
+            key.append(':').append(root.getPort());
+        }
+        return key.append(name.getPath()).toString();
+    }
+
+    private Answer linkAnswer(final String key) {
+        final Boolean announced = getAbstractFileSystem().isHardlinkAnnounced();
+        if (announced == null) {
+            return Answer.NOT_KNOWN;
+        }
+        if (!announced) {
+            return Answer.NO;
+        }
+        final LinkState state = getAbstractFileSystem().getLinkState(key);
+        return state == LinkState.LINKS ? Answer.YES : state == LinkState.NO_LINK ? Answer.NO : Answer.NOT_KNOWN;
+    }
+
+    private Answer replaceAnswer(final String folder) {
+        final Boolean announced = getAbstractFileSystem().isPosixRenameAnnounced();
+        if (announced == null) {
+            return Answer.NOT_KNOWN;
+        }
+        if (announced) {
+            return Answer.YES;
+        }
+        final ReplaceState state = getAbstractFileSystem().getReplaceState(folder);
+        return state == ReplaceState.REPLACES ? Answer.YES
+                : state == ReplaceState.NO_REPLACE ? Answer.NO : Answer.NOT_KNOWN;
+    }
+
+    @Override
+    public AtomicCapabilities atomicCapabilities() {
+        return new AtomicCapabilities(linkAnswer(folderKey(getName())), linkAnswer(pairKey(getName(), getName())),
+                replaceAnswer(folderKey(getName())));
+    }
+
+    @Override
+    public AtomicCapabilities atomicCapabilities(final FileObject target) {
+        // A folder has no hard link.
+        final Answer publish = getName().getType() == FileType.FOLDER ? Answer.NO
+                : linkAnswer(pairKey(getName(), target.getName()));
+        return new AtomicCapabilities(linkAnswer(folderKey(getName())), publish,
+                replaceAnswer(folderKey(target.getName())));
+    }
+
+    // The link routine of the exclusive steps, from a source path to a target path, on the channel of the call.
+    // It returns the outcome with the reply that decided it, or throws when a call ended with no reply.
+    private AtomicResult link(final AtomicCall call, final String source, final String target, final String probe,
+            final String key, final FileName targetName) throws FileSystemException {
+        final SftpFileSystem fileSystem = getAbstractFileSystem();
+        if (!call.isAnnounced(SftpFileSystem.HARDLINK) || fileSystem.getLinkState(key) == LinkState.NO_LINK) {
+            return call.result(AtomicOutcome.UNSUPPORTED, null);
+        }
+        final String point = pointKey(targetName);
+        final Exception refusal;
+        try {
+            call.channel.hardlink(source, target);
+            fileSystem.markLinks(key);
+            return call.result(AtomicOutcome.DONE, null);
+        } catch (final Exception e) {
+            if (!isReply(e)) {
+                throw call.notKnown("link", e);
+            }
+            if (isNoSuchFile(e)) {
+                return call.result(AtomicOutcome.GONE, detail(e));
+            }
+            refusal = e;
+        }
+        TestPoints.hold("link.after-refusal", point);
+        if (call.interrupted()) {
+            throw call.interruptedBefore("look after a refused link");
+        }
+        Exception lookError = null;
+        try {
+            call.channel.lstat(target);
+        } catch (final Exception e) {
+            lookError = e;
+        }
+        // The reply is read as it came, before a later interrupt.
+        final boolean lookReplied = lookError != null && isReply(lookError);
+        TestPoints.hold("link.after-look", point);
+        if (lookError == null) {
+            return call.result(AtomicOutcome.EXISTS, detail(refusal));
+        }
+        if (!lookReplied) {
+            throw call.notKnown("look after a refused link", lookError);
+        }
+        if (!isNoSuchFile(lookError)) {
+            return call.result(AtomicOutcome.REFUSED, detail(lookError));
+        }
+        // The holder released the name between the link and the look. A folder that linked once is never demoted.
+        if (fileSystem.getLinkState(key) == LinkState.LINKS) {
+            return call.result(AtomicOutcome.EXISTS, detail(refusal));
+        }
+        if (call.interrupted()) {
+            throw call.interruptedBefore("probe link");
+        }
+        try {
+            call.channel.hardlink(source, probe);
+        } catch (final Exception e) {
+            if (!isReply(e)) {
+                throw call.notKnown("probe link", e);
+            }
+            if (isNoSuchFile(e)) {
+                return call.result(AtomicOutcome.GONE, detail(e));
+            }
+            fileSystem.markNoLink(key);
+            if (fileSystem.firstWarning("link " + key)) {
+                LOG.warn("The SFTP server refused a probe link from \"" + source + "\" to \"" + probe
+                        + "\". This folder can not hold a hard link. Its exclusive step is not used while this file"
+                        + " system lives. The server replied " + detail(e) + ".");
+            }
+            return call.result(AtomicOutcome.UNSUPPORTED, detail(e));
+        }
+        // The folder can link, so the first refusal was a busy name.
+        fileSystem.markLinks(key);
+        call.remove(probe);
+        return call.result(AtomicOutcome.EXISTS, detail(refusal));
+    }
+
+    @Override
+    public AtomicResult createExclusive(final byte[] content, final String scratchName, final String probeName)
+            throws FileSystemException {
+        final String key = folderKey(getName());
+        final AtomicCall call = new AtomicCall(MovePhase.COMMIT, null, "vfs.provider/create-file.error",
+                getName().getFriendlyURI());
+        try {
+            // A server or a folder with no hard link gets no scratch file.
+            if (!call.isAnnounced(SftpFileSystem.HARDLINK)
+                    || getAbstractFileSystem().getLinkState(key) == LinkState.NO_LINK) {
+                return call.result(AtomicOutcome.UNSUPPORTED, null);
+            }
+            call.beforeFirst();
+            final String scratch = sibling(relPath, scratchName);
+            call.tempPath = sibling(getName().getPath(), scratchName);
+            try {
+                call.channel.put(new ByteArrayInputStream(content), scratch);
+            } catch (final Exception e) {
+                if (!isReply(e)) {
+                    throw call.notKnown("write of the scratch file", e);
+                }
+                // The server can refuse the write after it made the private scratch name, so that name is removed.
+                // A name that is not there is clean.
+                call.remove(scratch);
+                return call.result(AtomicOutcome.REFUSED, detail(e));
+            }
+            if (call.interrupted()) {
+                throw call.interruptedBefore("link of the scratch file");
+            }
+            final AtomicResult linked = link(call, scratch, relPath, sibling(relPath, probeName), key, getName());
+            call.remove(scratch);
+            return call.result(linked.getOutcome(), linked.getDetail());
+        } finally {
+            call.end();
+        }
+    }
+
+    @Override
+    public AtomicResult linkExclusive(final FileObject target, final String probeName) throws FileSystemException {
+        final AtomicCall call = new AtomicCall(MovePhase.RENAME, null, "vfs.provider/write.error",
+                target.getName().getFriendlyURI());
+        try {
+            final String targetPath = sftpOf(target).relPath;
+            call.beforeFirst();
+            return link(call, relPath, targetPath, sibling(targetPath, probeName), pairKey(getName(), target.getName()),
+                    target.getName());
+        } finally {
+            call.end();
+        }
+    }
+
+    @Override
+    public AtomicResult publishExclusive(final FileObject target, final String probeName) throws FileSystemException {
+        final AtomicCall call = new AtomicCall(MovePhase.COMMIT, getName().getPath(), "vfs.provider/write.error",
+                target.getName().getFriendlyURI());
+        try {
+            final String targetPath = sftpOf(target).relPath;
+            call.beforeFirst();
+            final AtomicResult linked = link(call, relPath, targetPath, sibling(targetPath, probeName),
+                    pairKey(getName(), target.getName()), target.getName());
+            if (linked.getOutcome() != AtomicOutcome.DONE) {
+                return linked;
+            }
+            TestPoints.hold("publish.after-link", pointKey(target.getName()));
+            call.remove(relPath);
+            return call.result(AtomicOutcome.DONE, linked.getDetail());
+        } finally {
+            call.end();
+        }
+    }
+
+    @Override
+    public AtomicResult renameReplacing(final FileObject target, final FileObject probeA, final FileObject probeB)
+            throws FileSystemException {
+        final String targetPath = sftpOf(target).relPath;
+        final AtomicCall call = new AtomicCall(MovePhase.COMMIT, getName().getPath(), "vfs.provider/rename.error",
+                getName().getFriendlyURI(), target.getName().getFriendlyURI());
+        try {
+            // With the posix rename JSch sends every rename as that request, which replaces an existing target.
+            final boolean stated = call.isAnnounced(SftpFileSystem.POSIX_RENAME);
+            final Exception refusal;
+            call.beforeFirst();
+            try {
+                call.channel.rename(relPath, targetPath);
+                return call.result(AtomicOutcome.DONE, null);
+            } catch (final Exception e) {
+                if (!isReply(e)) {
+                    throw call.notKnown("rename", e);
+                }
+                if (isNoSuchFile(e)) {
+                    return call.result(AtomicOutcome.GONE, detail(e));
+                }
+                refusal = e;
+            }
+            if (stated) {
+                return call.result(AtomicOutcome.REFUSED, detail(refusal));
+            }
+            // The refusal was a reply, so nothing changed. After an interrupt the look is not sent.
+            if (call.interrupted()) {
+                call.discard();
+                call.connectionLost = true;
+                return call.result(AtomicOutcome.REFUSED, detail(refusal));
+            }
+            try {
+                call.channel.lstat(targetPath);
+            } catch (final Exception e) {
+                if (!isReply(e)) {
+                    call.discard();
+                    call.connectionLost = true;
+                }
+                // A target that is not there can not be the reason.
+                return call.result(AtomicOutcome.REFUSED, detail(refusal));
+            }
+            final String folder = folderKey(target.getName());
+            final ReplaceState state = getAbstractFileSystem().getReplaceState(folder);
+            if (state == ReplaceState.REPLACES) {
+                return call.result(AtomicOutcome.REFUSED, detail(refusal));
+            }
+            if (state == ReplaceState.NO_REPLACE) {
+                return call.result(AtomicOutcome.UNSUPPORTED, detail(refusal));
+            }
+            if (probeA == null || probeB == null) {
+                return call.result(AtomicOutcome.REFUSED, detail(refusal));
+            }
+            return replaceTest(call, detail(refusal), sftpOf(probeA).relPath, sftpOf(probeB).relPath, folder);
+        } finally {
+            call.end();
+        }
+    }
+
+    // Does this server refuse a rename only because the target exists. It touches only the two probe files.
+    private AtomicResult replaceTest(final AtomicCall call, final String refusal, final String probeA,
+            final String probeB, final String folder) {
+        for (final String probe : new String[] {probeA, probeB}) {
+            if (call.interrupted()) {
+                return testLost(call, refusal, probeA, probeB);
+            }
+            try {
+                call.channel.put(new ByteArrayInputStream(PROBE_CONTENT), probe);
+            } catch (final Exception e) {
+                if (!isReply(e)) {
+                    return testLost(call, refusal, probeA, probeB);
+                }
+                call.remove(probeA);
+                if (probe == probeB) {
+                    call.remove(probeB);
+                }
+                return call.result(AtomicOutcome.REFUSED, refusal);
+            }
+        }
+        if (call.interrupted()) {
+            return testLost(call, refusal, probeA, probeB);
+        }
+        try {
+            call.channel.rename(probeA, probeB);
+            call.remove(probeB);
+            getAbstractFileSystem().markReplaces(folder);
+            return call.result(AtomicOutcome.REFUSED, refusal);
+        } catch (final Exception e) {
+            if (!isReply(e)) {
+                return testLost(call, refusal, probeA, probeB);
+            }
+        }
+        // The control: the same rename with only the existing target taken away.
+        if (call.interrupted()) {
+            return testLost(call, refusal, probeA, probeB);
+        }
+        try {
+            call.channel.rm(probeB);
+        } catch (final Exception e) {
+            if (!isReply(e)) {
+                return testLost(call, refusal, probeA, probeB);
+            }
+            call.leftovers.add(probeB);
+            call.remove(probeA);
+            return call.result(AtomicOutcome.REFUSED, refusal);
+        }
+        if (call.interrupted()) {
+            return testLost(call, refusal, probeA, probeB);
+        }
+        try {
+            call.channel.rename(probeA, probeB);
+        } catch (final Exception e) {
+            if (!isReply(e)) {
+                return testLost(call, refusal, probeA, probeB);
+            }
+            call.remove(probeA);
+            return call.result(AtomicOutcome.REFUSED, refusal);
+        }
+        call.remove(probeB);
+        getAbstractFileSystem().markNoReplace(folder);
+        if (getAbstractFileSystem().firstWarning("replace " + folder)) {
+            LOG.warn("The SFTP server does not replace an existing name on a rename in the folder \"" + folder
+                    + "\". The replace test on two probe files showed it.");
+        }
+        return call.result(AtomicOutcome.UNSUPPORTED, refusal);
+    }
+
+    // A transport error or an interrupt in the replace test decides nothing and remembers nothing.
+    private static AtomicResult testLost(final AtomicCall call, final String refusal, final String probeA,
+            final String probeB) {
+        call.discard();
+        call.connectionLost = true;
+        call.leftovers.add(probeA);
+        call.leftovers.add(probeB);
+        return call.result(AtomicOutcome.REFUSED, refusal);
+    }
+
+    @Override
+    public AtomicResult takeAway(final FileObject awayTarget) throws FileSystemException {
+        final String awayPath = sftpOf(awayTarget).relPath;
+        final AtomicCall call = new AtomicCall(MovePhase.RENAME, null, "vfs.provider/rename.error",
+                getName().getFriendlyURI(), awayTarget.getName().getFriendlyURI());
+        // The check discards the channel when it throws.
+        call.beforeFirst();
+        try {
+            call.channel.rename(relPath, awayPath);
+            return call.result(AtomicOutcome.DONE, null);
+        } catch (final Exception e) {
+            if (!isReply(e)) {
+                throw call.notKnown("take away", e);
+            }
+            return call.result(isNoSuchFile(e) ? AtomicOutcome.GONE : AtomicOutcome.REFUSED, detail(e));
+        } finally {
+            call.end();
+        }
+    }
+
+    // One lstat of this name, with no stat retry. Null when the server said that the name is not there.
+    private SftpATTRS lookNow() throws FileSystemException {
+        final ChannelSftp channel;
+        try {
+            channel = getAbstractFileSystem().getChannel();
+        } catch (final FileSystemException e) {
+            throw e;
+        } catch (final IOException e) {
+            throw new FileSystemException(e);
+        }
+        Throwable failure = null;
+        try {
+            return channel.lstat(relPath);
+        } catch (final Exception e) {
+            failure = e;
+            if (isReply(e) && isNoSuchFile(e)) {
+                return null;
+            }
+            final FileSystemException error = new FileSystemException("vfs.provider/look.error", e,
+                    getName().getFriendlyURI());
+            error.setFault(isReply(e) ? Faults.of(e) : Fault.TRANSPORT);
+            throw error;
+        } finally {
+            release(channel, failure);
+        }
+    }
+
+    // A look that has no answer for a reason of the server, the folder or the name. It is an application error.
+    private static FileSystemException applicationError(final String code, final Object name) {
+        final FileSystemException error = new FileSystemException(code, name);
+        error.setFault(Fault.APPLICATION);
+        return error;
+    }
+
+    @Override
+    public boolean existsNow() throws FileSystemException {
+        return lookNow() != null;
+    }
+
+    @Override
+    public boolean folderExistsNow() throws FileSystemException {
+        final SftpATTRS found = lookNow();
+        if (found == null) {
+            return false;
+        }
+        if (!found.isDir()) {
+            throw applicationError("vfs.provider/look-not-folder.error", getName().getFriendlyURI());
+        }
+        return true;
+    }
+
+    @Override
+    public StatNow statNow() throws FileSystemException {
+        final SftpATTRS found = lookNow();
+        return found == null ? StatNow.notThere()
+                : StatNow.there(found.getSize(), (found.getMTime() & 0xFFFFFFFFL) * MOD_TIME_FACTOR, false);
     }
 
 }

@@ -45,6 +45,7 @@ import com.hierynomus.smbj.session.Session;
 import com.hierynomus.smbj.share.Directory;
 import com.hierynomus.smbj.share.DiskEntry;
 import com.hierynomus.smbj.share.DiskShare;
+import com.hierynomus.smbj.share.File;
 import com.hierynomus.smbj.transport.TransportLayerFactory;
 import com.hierynomus.smbj.transport.tcp.direct.DirectTcpTransportFactory;
 import org.apache.commons.logging.Log;
@@ -473,6 +474,31 @@ public class Smb2ClientWrapper extends SMBClient {
      * @param isFolder true for a folder.
      * @return the handle. The caller closes it.
      */
+    // The exclusive create: the open fails when the name exists.
+    File openCreate(final String path) {
+        final ArrayList<String> diskShareAccessMask = Smb2FileSystemConfigBuilder.getInstance()
+                .getDiskShareAccessMask(fileSystemOptions);
+        return diskShare.openFile(path, resolveAccessMaskOrDefault(diskShareAccessMask, AccessMask.GENERIC_WRITE),
+                EnumSet.of(FileAttributes.FILE_ATTRIBUTE_NORMAL), EnumSet.of(SMB2ShareAccess.FILE_SHARE_READ),
+                SMB2CreateDisposition.FILE_CREATE, EnumSet.of(SMB2CreateOptions.FILE_NON_DIRECTORY_FILE));
+    }
+
+    // The open of a file for a hard link. It never creates a missing file.
+    DiskEntry openForLink(final String path) {
+        return diskShare.open(path, EnumSet.of(AccessMask.DELETE, AccessMask.FILE_READ_ATTRIBUTES),
+                EnumSet.of(FileAttributes.FILE_ATTRIBUTE_NORMAL), SMB2ShareAccess.ALL, SMB2CreateDisposition.FILE_OPEN,
+                null);
+    }
+
+    // The look at a name, with the exception of smbj as it came.
+    FileAllInformation look(final String path) {
+        return query(path);
+    }
+
+    void remove(final String path) {
+        diskShare.rm(path);
+    }
+
     public DiskEntry openForRename(String path, boolean isFolder) {
         ArrayList<String> diskShareAccessMask = Smb2FileSystemConfigBuilder.getInstance()
                 .getDiskShareAccessMask(fileSystemOptions);

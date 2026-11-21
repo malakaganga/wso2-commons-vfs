@@ -18,7 +18,9 @@
 
 package org.wso2.org.apache.commons.vfs2.provider.smb2;
 
+import com.hierynomus.mserref.NtStatus;
 import com.hierynomus.msfscc.fileinformation.FileAllInformation;
+import com.hierynomus.mssmb2.SMBApiException;
 import com.hierynomus.smbj.share.DiskEntry;
 import com.hierynomus.smbj.share.File;
 import org.apache.commons.logging.Log;
@@ -29,9 +31,21 @@ import org.wso2.org.apache.commons.vfs2.FileSystemException;
 import org.wso2.org.apache.commons.vfs2.FileType;
 import org.wso2.org.apache.commons.vfs2.provider.AbstractFileName;
 import org.wso2.org.apache.commons.vfs2.provider.AbstractFileObject;
+import org.wso2.org.apache.commons.vfs2.provider.AtomicCapabilities;
+import org.wso2.org.apache.commons.vfs2.provider.AtomicCapabilities.Answer;
+import org.wso2.org.apache.commons.vfs2.provider.AtomicOps;
+import org.wso2.org.apache.commons.vfs2.provider.AtomicOutcome;
+import org.wso2.org.apache.commons.vfs2.provider.AtomicResult;
+import org.wso2.org.apache.commons.vfs2.provider.Fault;
+import org.wso2.org.apache.commons.vfs2.provider.GenericFileName;
+import org.wso2.org.apache.commons.vfs2.provider.MovePhase;
+import org.wso2.org.apache.commons.vfs2.provider.StatNow;
+import org.wso2.org.apache.commons.vfs2.provider.UnclearResultException;
 import org.wso2.org.apache.commons.vfs2.provider.UriParser;
+import org.wso2.org.apache.commons.vfs2.util.FileObjectUtils;
 import org.wso2.org.apache.commons.vfs2.util.MonitorInputStream;
 import org.wso2.org.apache.commons.vfs2.util.MonitorOutputStream;
+import org.wso2.org.apache.commons.vfs2.util.TestPoints;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -45,7 +59,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  * Class containing all its handles from the current Instance but NOT all
  * possible handles to the same file (read/write separated)
  */
-public class Smb2FileObject extends AbstractFileObject<Smb2FileSystem> {
+public class Smb2FileObject extends AbstractFileObject<Smb2FileSystem> implements AtomicOps {
 
     private static final Log LOG = LogFactory.getLog(Smb2FileObject.class);
     private static final char[] RESERVED_FILE_CHARS = {' ', '#'};
@@ -411,6 +425,451 @@ public class Smb2FileObject extends AbstractFileObject<Smb2FileSystem> {
      * from it the first transport error of any step. After a transport error the sockets of the client are closed
      * first, so no close step waits for a reply on a dead connection, and the client is discarded.
      */
+    // One call of AtomicOps on one client. A client whose call ended with a transport error is discarded at once and
+    // not used again.
+    private final class AtomicCall {
+
+        private final Smb2FileSystem fileSystem = (Smb2FileSystem) getFileSystem();
+
+        // The phase of the public call, which an unconfirmed change reports, and its temp path or null.
+        private final MovePhase phase;
+
+        private final String tempPath;
+
+        private Smb2ClientWrapper client;
+
+        private final List<String> leftovers = new ArrayList<>();
+
+        private boolean connectionLost;
+
+        AtomicCall(final MovePhase phase, final String tempPath) throws FileSystemException {
+            this.phase = phase;
+            this.tempPath = tempPath;
+            client = (Smb2ClientWrapper) fileSystem.getClient();
+        }
+
+        // The NT status of a reply of the server, or null for a transport error, an interrupt or any other error.
+        NtStatus statusOf(final Throwable error) {
+            return error instanceof SMBApiException && !Smb2FileSystem.isTransport(client, error)
+                    ? ((SMBApiException) error).getStatus() : null;
+        }
+
+        void discard(final Throwable cause) {
+            if (client != null) {
+                fileSystem.discardClient(client, cause);
+                client = null;
+            }
+        }
+
+        void end() {
+            if (client != null) {
+                fileSystem.putClient(client);
+                client = null;
+            }
+        }
+
+        // A failed close of a handle after the step that decided. The client is discarded, whatever the fault.
+        void closeFailed(final RuntimeException closeError) {
+            if (closeError != null) {
+                connectionLost |= Smb2FileSystem.isTransport(client, closeError);
+                discard(closeError);
+            }
+        }
+
+        // Removes a name. A name that the server could not remove is a leftover.
+        void remove(final String path) {
+            if (client == null) {
+                leftovers.add(path);
+                return;
+            }
+            try {
+                client.remove(path);
+            } catch (final RuntimeException e) {
+                final NtStatus status = statusOf(e);
+                if (status == null) {
+                    connectionLost = true;
+                    discard(e);
+                    leftovers.add(path);
+                } else if (status != NtStatus.STATUS_OBJECT_NAME_NOT_FOUND
+                        && status != NtStatus.STATUS_OBJECT_PATH_NOT_FOUND) {
+                    leftovers.add(path);
+                }
+            }
+        }
+
+        AtomicResult result(final AtomicOutcome outcome, final String detail) {
+            return new AtomicResult(outcome, detail, leftovers, connectionLost);
+        }
+
+        // A change whose outcome no reply of the server confirmed. The client is discarded before the error leaves,
+        // and no further call is made.
+        UnclearResultException notKnown(final String step, final Throwable cause) {
+            discard(cause);
+            return new UnclearResultException("vfs.provider/atomic-not-known.error", cause, phase, tempPath, false,
+                    step, getName().getFriendlyURI());
+        }
+    }
+
+    private static String relPathOf(final FileObject file) throws FileSystemException {
+        return ((Smb2FileObject) FileObjectUtils.getAbstractFileObject(file)).getRelPathToShare();
+    }
+
+    // The folder of a name. A root has no parent, so it is its own folder.
+    private static String folderOf(final FileName name) {
+        final FileName parent = name.getParent();
+        return (parent == null ? name : parent).getPath();
+    }
+
+    private static String pairKey(final FileName source, final FileName target) {
+        return folderOf(source) + "\u0000" + folderOf(target);
+    }
+
+    // The file URI of a test point: no user part and no query.
+    private static String pointKey(final FileName name) {
+        final GenericFileName root = (GenericFileName) name.getRoot();
+        final StringBuilder key = new StringBuilder(root.getScheme()).append("://").append(root.getHostName());
+        if (root.getPort() != root.getDefaultPort()) {
+            key.append(':').append(root.getPort());
+        }
+        return key.append(name.getPath()).toString();
+    }
+
+    private Answer publishAnswer(final String pair) {
+        final Smb2FileSystem fileSystem = (Smb2FileSystem) getFileSystem();
+        if (fileSystem.isLinked(pair)) {
+            return Answer.YES;
+        }
+        return fileSystem.isMarkedNoLink(pair, TestPoints.nanoTime("linkmark")) ? Answer.NO : Answer.NOT_KNOWN;
+    }
+
+    @Override
+    public AtomicCapabilities atomicCapabilities() {
+        return new AtomicCapabilities(Answer.YES, publishAnswer(pairKey(getName(), getName())), Answer.YES);
+    }
+
+    @Override
+    public AtomicCapabilities atomicCapabilities(final FileObject target) {
+        // A folder has no hard link.
+        final Answer publish = getName().getType() == FileType.FOLDER ? Answer.NO
+                : publishAnswer(pairKey(getName(), target.getName()));
+        return new AtomicCapabilities(Answer.YES, publish, Answer.YES);
+    }
+
+    @Override
+    public AtomicResult createExclusive(final byte[] content, final String scratchName, final String probeName)
+            throws FileSystemException {
+        final String path = getRelPathToShare();
+        final AtomicCall call = new AtomicCall(MovePhase.COMMIT, null);
+        try {
+            final File file;
+            try {
+                file = call.client.openCreate(path);
+            } catch (final RuntimeException e) {
+                final NtStatus status = call.statusOf(e);
+                if (status == null) {
+                    throw call.notKnown("exclusive create", e);
+                }
+                return call.result(status == NtStatus.STATUS_OBJECT_NAME_COLLISION ? AtomicOutcome.EXISTS
+                        : status == NtStatus.STATUS_OBJECT_PATH_NOT_FOUND ? AtomicOutcome.GONE
+                        : AtomicOutcome.REFUSED, status.name());
+            }
+            RuntimeException writeError = null;
+            try {
+                file.write(content, 0);
+            } catch (final RuntimeException e) {
+                writeError = e;
+            }
+            final RuntimeException closeError = call.client.closeOwned(file, writeError);
+            final RuntimeException failure = writeError != null ? writeError : closeError;
+            if (failure == null) {
+                return call.result(AtomicOutcome.DONE, null);
+            }
+            final NtStatus status = call.statusOf(failure);
+            if (status == null || writeError != null && closeError != null && call.statusOf(closeError) == null) {
+                // The file is left. An empty or a cut lock is the job of the lock module.
+                throw call.notKnown("write of the created file", failure);
+            }
+            call.remove(path);
+            return call.result(AtomicOutcome.REFUSED, status.name());
+        } finally {
+            call.end();
+        }
+    }
+
+    // The link from this file to the target path, on the client of the call.
+    private AtomicResult link(final AtomicCall call, final String targetPath, final String pair)
+            throws FileSystemException {
+        final DiskEntry entry;
+        try {
+            entry = call.client.openForLink(getRelPathToShare());
+        } catch (final RuntimeException e) {
+            return linkRefused(call, e, pair, targetPath);
+        }
+        RuntimeException linkError = null;
+        try {
+            entry.createHardlink(targetPath, false);
+        } catch (final RuntimeException e) {
+            linkError = e;
+        }
+        final RuntimeException closeError = call.client.closeOwned(entry, linkError);
+        if (linkError != null) {
+            final AtomicResult refused = linkRefused(call, linkError, pair, targetPath);
+            call.closeFailed(closeError);
+            return call.result(refused.getOutcome(), refused.getDetail());
+        }
+        ((Smb2FileSystem) getFileSystem()).markLinks(pair);
+        // A failed close after the link returned is not a failure of the link.
+        call.closeFailed(closeError);
+        return call.result(AtomicOutcome.DONE, null);
+    }
+
+    private AtomicResult linkRefused(final AtomicCall call, final RuntimeException error, final String pair,
+            final String targetPath) throws FileSystemException {
+        final NtStatus status = call.statusOf(error);
+        if (status == null) {
+            throw call.notKnown("link", error);
+        }
+        switch (status) {
+        case STATUS_OBJECT_NAME_COLLISION:
+            return call.result(AtomicOutcome.EXISTS, status.name());
+        case STATUS_OBJECT_NAME_NOT_FOUND:
+        case STATUS_OBJECT_PATH_NOT_FOUND:
+            return call.result(AtomicOutcome.GONE, status.name());
+        case STATUS_SHARING_VIOLATION:
+        case STATUS_DELETE_PENDING:
+            return call.result(AtomicOutcome.BUSY, status.name());
+        default:
+            break;
+        }
+        final Smb2FileSystem fileSystem = (Smb2FileSystem) getFileSystem();
+        if (fileSystem.isLinked(pair)) {
+            return call.result(AtomicOutcome.REFUSED, status.name());
+        }
+        if (fileSystem.markNoLink(pair, TestPoints.nanoTime("linkmark"))) {
+            LOG.warn("The SMB2 server refused a hard link from \"" + getRelPathToShare() + "\" to \"" + targetPath
+                    + "\" with " + status.name() + ". This folder pair is not used for a link for 10 minutes.");
+        }
+        return call.result(AtomicOutcome.UNSUPPORTED, status.name());
+    }
+
+    @Override
+    public AtomicResult linkExclusive(final FileObject target, final String probeName) throws FileSystemException {
+        final String pair = pairKey(getName(), target.getName());
+        final Smb2FileSystem fileSystem = (Smb2FileSystem) getFileSystem();
+        if (!fileSystem.isLinked(pair) && fileSystem.isMarkedNoLink(pair, TestPoints.nanoTime("linkmark"))) {
+            return new AtomicResult(AtomicOutcome.UNSUPPORTED, null);
+        }
+        final String targetPath = relPathOf(target);
+        final AtomicCall call = new AtomicCall(MovePhase.RENAME, null);
+        try {
+            return link(call, targetPath, pair);
+        } finally {
+            call.end();
+        }
+    }
+
+    @Override
+    public AtomicResult publishExclusive(final FileObject target, final String probeName) throws FileSystemException {
+        final String pair = pairKey(getName(), target.getName());
+        final Smb2FileSystem fileSystem = (Smb2FileSystem) getFileSystem();
+        if (!fileSystem.isLinked(pair) && fileSystem.isMarkedNoLink(pair, TestPoints.nanoTime("linkmark"))) {
+            return new AtomicResult(AtomicOutcome.UNSUPPORTED, null);
+        }
+        final String targetPath = relPathOf(target);
+        final AtomicCall call = new AtomicCall(MovePhase.COMMIT, getName().getPath());
+        try {
+            final AtomicResult linked = link(call, targetPath, pair);
+            if (linked.getOutcome() != AtomicOutcome.DONE) {
+                return linked;
+            }
+            TestPoints.hold("publish.after-link", pointKey(target.getName()));
+            call.remove(getRelPathToShare());
+            return call.result(AtomicOutcome.DONE, null);
+        } finally {
+            call.end();
+        }
+    }
+
+    // The NT status of the first server reply in the cause chain of an error, or null when the chain holds none or
+    // shows a transport failure.
+    private static NtStatus statusIn(final AtomicCall call, final Throwable error) {
+        for (Throwable link = error; link != null && link.getCause() != link; link = link.getCause()) {
+            if (link instanceof SMBApiException) {
+                return call.statusOf(link);
+            }
+        }
+        return null;
+    }
+
+    // A rename of this file on the client of the call, with the outcome of each reply that refused it. The type of the
+    // source is read on that client just before the open, because another client can put a file in place of a folder,
+    // or a folder in place of a file, after this object read its type. A folder is opened as a directory, with the
+    // open and share flags of a directory rename.
+    private AtomicResult rename(final AtomicCall call, final String targetPath, final boolean replace,
+            final String step) throws FileSystemException {
+        final FileAllInformation now;
+        try {
+            now = call.client.getFileInfo(getRelPathToShare());
+        } catch (final FileSystemException e) {
+            // Nothing was sent that changes the server. A transport failure retires the client. A status reply of the
+            // server about the source, for example a pending delete, has the outcome of the same status at the open.
+            if (e.getFault() == Fault.TRANSPORT) {
+                call.discard(e);
+                throw e;
+            }
+            final NtStatus status = statusIn(call, e);
+            if (status == null) {
+                throw e;
+            }
+            return call.result(renameOutcome(status, true, replace), status.name());
+        }
+        final boolean folder = now != null && now.getStandardInformation().isDirectory();
+        final DiskEntry entry;
+        try {
+            // The open never creates a missing source and never shares delete.
+            entry = call.client.openForRename(getRelPathToShare(), folder);
+        } catch (final RuntimeException e) {
+            final NtStatus status = call.statusOf(e);
+            if (status == null) {
+                throw call.notKnown(step, e);
+            }
+            return call.result(renameOutcome(status, true, replace), status.name());
+        }
+        RuntimeException renameError = null;
+        try {
+            entry.rename(targetPath, replace);
+        } catch (final RuntimeException e) {
+            renameError = e;
+        }
+        final RuntimeException closeError = call.client.closeOwned(entry, renameError);
+        if (renameError != null) {
+            final NtStatus status = call.statusOf(renameError);
+            if (status == null) {
+                throw call.notKnown(step, renameError);
+            }
+            call.closeFailed(closeError);
+            return call.result(renameOutcome(status, false, replace), status.name());
+        }
+        if (closeError != null) {
+            LOG.warn("The " + step + " of " + getName().getFriendlyURI() + " is done, but the close of its handle"
+                    + " failed. The client is discarded.", closeError);
+            call.closeFailed(closeError);
+        }
+        return call.result(AtomicOutcome.DONE, null);
+    }
+
+    // The replacing rename and the take away read the same statuses in two ways.
+    private static AtomicOutcome renameOutcome(final NtStatus status, final boolean open, final boolean replace) {
+        if (replace) {
+            switch (status) {
+            case STATUS_OBJECT_NAME_NOT_FOUND:
+            case STATUS_OBJECT_PATH_NOT_FOUND:
+                return AtomicOutcome.GONE;
+            case STATUS_SHARING_VIOLATION:
+                return AtomicOutcome.BUSY;
+            default:
+                return AtomicOutcome.REFUSED;
+            }
+        }
+        if (status == NtStatus.STATUS_OBJECT_NAME_NOT_FOUND) {
+            return AtomicOutcome.GONE;
+        }
+        if (open && status == NtStatus.STATUS_SHARING_VIOLATION) {
+            return AtomicOutcome.BUSY;
+        }
+        if (!open && status == NtStatus.STATUS_OBJECT_NAME_COLLISION) {
+            return AtomicOutcome.EXISTS;
+        }
+        return AtomicOutcome.REFUSED;
+    }
+
+    @Override
+    public AtomicResult renameReplacing(final FileObject target, final FileObject probeA, final FileObject probeB)
+            throws FileSystemException {
+        // The replace flag is part of the protocol, so no replace test exists here and the probe files are not used.
+        final String targetPath = relPathOf(target);
+        final AtomicCall call = new AtomicCall(MovePhase.COMMIT, getName().getPath());
+        try {
+            return rename(call, targetPath, true, "replacing rename");
+        } finally {
+            call.end();
+        }
+    }
+
+    @Override
+    public AtomicResult takeAway(final FileObject awayTarget) throws FileSystemException {
+        final String awayPath = relPathOf(awayTarget);
+        final AtomicCall call = new AtomicCall(MovePhase.RENAME, null);
+        try {
+            return rename(call, awayPath, false, "take away");
+        } finally {
+            call.end();
+        }
+    }
+
+    // One look at this name. Null when the server said that the name is not there. A delete pending counts as there
+    // only when the caller asks so, and then the answer has no information.
+    private FileAllInformation lookNow(final boolean pendingIsThere, final boolean[] pending)
+            throws FileSystemException {
+        final Smb2FileSystem fileSystem = (Smb2FileSystem) getFileSystem();
+        final Smb2ClientWrapper client = (Smb2ClientWrapper) fileSystem.getClient();
+        Throwable failure = null;
+        try {
+            return client.look(getRelPathToShare());
+        } catch (final RuntimeException e) {
+            failure = e;
+            final NtStatus status = e instanceof SMBApiException && !Smb2FileSystem.isTransport(client, e)
+                    ? ((SMBApiException) e).getStatus() : null;
+            if (status == NtStatus.STATUS_OBJECT_NAME_NOT_FOUND || status == NtStatus.STATUS_OBJECT_PATH_NOT_FOUND
+                    || status == NtStatus.STATUS_NO_SUCH_FILE) {
+                return null;
+            }
+            if (pendingIsThere && status == NtStatus.STATUS_DELETE_PENDING) {
+                pending[0] = true;
+                return null;
+            }
+            final FileSystemException error = new FileSystemException("vfs.provider/look.error", e,
+                    getName().getFriendlyURI());
+            error.setFault(status == null ? Fault.TRANSPORT : client.faultOf(e));
+            throw error;
+        } finally {
+            fileSystem.giveBack(client, failure);
+        }
+    }
+
+    // A look that has no answer for a reason of the server, the folder or the name. It is an application error.
+    private static FileSystemException applicationError(final String code, final Object name) {
+        final FileSystemException error = new FileSystemException(code, name);
+        error.setFault(Fault.APPLICATION);
+        return error;
+    }
+
+    @Override
+    public boolean existsNow() throws FileSystemException {
+        final boolean[] pending = new boolean[1];
+        return lookNow(true, pending) != null || pending[0];
+    }
+
+    @Override
+    public boolean folderExistsNow() throws FileSystemException {
+        final FileAllInformation found = lookNow(false, null);
+        if (found == null) {
+            return false;
+        }
+        if (!found.getStandardInformation().isDirectory()) {
+            throw applicationError("vfs.provider/look-not-folder.error", getName().getFriendlyURI());
+        }
+        return true;
+    }
+
+    @Override
+    public StatNow statNow() throws FileSystemException {
+        final FileAllInformation found = lookNow(false, null);
+        return found == null ? StatNow.notThere()
+                : StatNow.there(found.getStandardInformation().getEndOfFile(),
+                        found.getBasicInformation().getLastWriteTime().toEpochMillis(), false);
+    }
+
     class Smb2InputStream extends MonitorInputStream {
         private final Smb2ClientWrapper client;
         private final FileObject fileObject;

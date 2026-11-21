@@ -20,6 +20,7 @@ import java.io.IOException;
 import java.util.Collection;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
 
@@ -61,6 +62,21 @@ public class FtpFileSystem extends AbstractFileSystem {
     private final FileSystemOptions clientOptions;
 
     private volatile boolean isFileSystemClosed = false;
+
+    // A target folder that is not in the map is not known.
+    enum ReplaceState {
+        REPLACES, NO_REPLACE
+    }
+
+    // The folders that a WARN was logged for, in this copy of the fork.
+    private static final Set<String> WARNED = ConcurrentHashMap.newKeySet();
+
+    // The replace state per target folder. "Replaces" never changes again.
+    private final ConcurrentMap<String, ReplaceState> replaceStates = new ConcurrentHashMap<>();
+
+    // Set when one listing with the option -a gave at least one entry on this file system. Until then an empty
+    // listing with the option is followed by one plain listing.
+    private volatile boolean hiddenOptionSeen;
 
     /**
      * Constructs a new instance.
@@ -224,6 +240,33 @@ public class FtpFileSystem extends AbstractFileSystem {
      * Closes the sockets of the idle client and of every client that is out. It sends no command and takes no
      * monitor, so any thread may call it.
      */
+    ReplaceState getReplaceState(final String folder) {
+        return replaceStates.get(folder);
+    }
+
+    void markReplaces(final String folder) {
+        replaceStates.put(folder, ReplaceState.REPLACES);
+    }
+
+    // A folder that replaces keeps that state.
+    void markNoReplace(final String folder) {
+        replaceStates.putIfAbsent(folder, ReplaceState.NO_REPLACE);
+    }
+
+    boolean isHiddenOptionSeen() {
+        return hiddenOptionSeen;
+    }
+
+    void markHiddenOptionSeen() {
+        hiddenOptionSeen = true;
+    }
+
+    // True only for the first WARN about this subject on this server in this copy of the fork.
+    boolean firstWarning(final String subject) {
+        final GenericFileName root = (GenericFileName) getRootName();
+        return WARNED.add(root.getScheme() + "://" + root.getHostName() + ":" + root.getPort() + " " + subject);
+    }
+
     @Override
     public void abort() {
         for (final FtpClient client : clients) {

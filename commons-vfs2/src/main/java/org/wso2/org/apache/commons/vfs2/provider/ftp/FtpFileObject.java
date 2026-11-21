@@ -21,7 +21,9 @@ import java.io.FilterOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Calendar;
 import java.util.List;
@@ -36,6 +38,7 @@ import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.commons.net.ftp.FTPFile;
 import org.apache.commons.net.ftp.FTPReply;
+import org.apache.commons.net.ftp.parser.MLSxEntryParser;
 import org.wso2.org.apache.commons.vfs2.FileName;
 import org.wso2.org.apache.commons.vfs2.FileNotFolderException;
 import org.wso2.org.apache.commons.vfs2.FileNotFoundException;
@@ -45,8 +48,22 @@ import org.wso2.org.apache.commons.vfs2.FileType;
 import org.wso2.org.apache.commons.vfs2.RandomAccessContent;
 import org.wso2.org.apache.commons.vfs2.provider.AbstractFileName;
 import org.wso2.org.apache.commons.vfs2.provider.AbstractFileObject;
+import org.wso2.org.apache.commons.vfs2.provider.AtomicCapabilities;
+import org.wso2.org.apache.commons.vfs2.provider.AtomicCapabilities.Answer;
+import org.wso2.org.apache.commons.vfs2.provider.AtomicOps;
+import org.wso2.org.apache.commons.vfs2.provider.AtomicOutcome;
+import org.wso2.org.apache.commons.vfs2.provider.AtomicResult;
 import org.wso2.org.apache.commons.vfs2.provider.Fault;
+import org.wso2.org.apache.commons.vfs2.provider.Faults;
+import org.wso2.org.apache.commons.vfs2.provider.MovePhase;
+import org.wso2.org.apache.commons.vfs2.provider.StatNow;
+import org.wso2.org.apache.commons.vfs2.provider.UnclearResultException;
 import org.wso2.org.apache.commons.vfs2.provider.UriParser;
+import org.wso2.org.apache.commons.vfs2.provider.ftp.FtpClient.Change;
+import org.wso2.org.apache.commons.vfs2.provider.ftp.FtpClient.Listing;
+import org.wso2.org.apache.commons.vfs2.provider.ftp.FtpClient.RenameReplies;
+import org.wso2.org.apache.commons.vfs2.provider.ftp.FtpClient.Reply;
+import org.wso2.org.apache.commons.vfs2.provider.ftp.FtpFileSystem.ReplaceState;
 import org.wso2.org.apache.commons.vfs2.util.FileObjectUtils;
 import org.wso2.org.apache.commons.vfs2.util.Messages;
 import org.wso2.org.apache.commons.vfs2.util.MonitorInputStream;
@@ -56,7 +73,7 @@ import org.wso2.org.apache.commons.vfs2.util.RandomAccessMode;
 /**
  * An FTP file.
  */
-public class FtpFileObject extends AbstractFileObject<FtpFileSystem> {
+public class FtpFileObject extends AbstractFileObject<FtpFileSystem> implements AtomicOps {
 
     /**
      * An InputStream that monitors for end-of-file.
@@ -346,6 +363,18 @@ public class FtpFileObject extends AbstractFileObject<FtpFileSystem> {
         final FtpClient client = getAbstractFileSystem().getClient();
         final FileSystemException refused = run(client, c -> c.makeDirectory(relPath) ? null
                 : refusal(c, "vfs.provider.ftp/create-folder-reply.error", false, getName()));
+        if (refused != null && refused.getFault() != Fault.TRANSPORT) {
+            // A folder that can be entered counts as made, also when the server hides it from a listing.
+            final Change change = run(client, c -> c.enterAndBack(relPath));
+            if (change.isEntered()) {
+                if (change.isBackRefused()) {
+                    getAbstractFileSystem().discardClient(client);
+                } else {
+                    getAbstractFileSystem().putClient(client);
+                }
+                return;
+            }
+        }
         giveBack(client, refused);
         if (refused != null) {
             throw refused;
@@ -415,20 +444,42 @@ public class FtpFileObject extends AbstractFileObject<FtpFileSystem> {
     }
 
     /**
-     * Fetches the children of this file, if not already cached.
+     * Fetches the children of this file with the checked listing, if not already cached. A listing that was refused or
+     * cut throws, and never gives an empty or a short folder.
+     *
+     * @return false when the folder can not be entered.
      */
-    private void doGetChildren() throws IOException {
+    private boolean doGetChildren() throws IOException {
         if (!childMap.isEmpty()) {
-            return;
+            return true;
         }
 
         final String path = ftpFile != null && ftpFile.isSymbolicLink()
                 ? getFileSystem().getFileSystemManager().resolveName(getParent().getName(), ftpFile.getLink())
                         .getPath()
                 : relPath;
-        final FtpClient client = getAbstractFileSystem().getClient();
-        final FTPFile[] tmpChildren = run(client, c -> c.listFiles(path));
-        getAbstractFileSystem().putClient(client);
+        FtpClient client = getAbstractFileSystem().getClient();
+        Listing listing = run(client, c -> checkedListing(c, path));
+        if (needsPlainListing(listing)) {
+            // The client is in another folder now, so it is not used again. The plain listing runs on a fresh client.
+            getAbstractFileSystem().discardClient(client);
+            client = getAbstractFileSystem().getClient();
+            listing = run(client, c -> c.listChecked(path, false));
+        }
+        final FileSystemException failed = listing.getFailure() == null ? null
+                : listFailure(path, listing.getFailure());
+        if (listing.isBackRefused()) {
+            getAbstractFileSystem().discardClient(client);
+        } else {
+            giveBack(client, failed);
+        }
+        if (failed != null) {
+            throw failed;
+        }
+        final FTPFile[] tmpChildren = listing.getEntries();
+        if (tmpChildren == null) {
+            return false;
+        }
         if (!ArrayUtils.isEmpty(tmpChildren)) {
             // Remove '.' and '..' elements
             for (int i = 0; i < tmpChildren.length; i++) {
@@ -445,6 +496,7 @@ public class FtpFileObject extends AbstractFileObject<FtpFileSystem> {
                 }
             }
         }
+        return true;
     }
 
     /**
@@ -572,8 +624,10 @@ public class FtpFileObject extends AbstractFileObject<FtpFileSystem> {
      */
     @Override
     protected String[] doListChildren() throws Exception {
-        // List the children of this file
-        doGetChildren();
+        // List the children of this file. A folder that can not be entered can not be listed.
+        if (!doGetChildren()) {
+            throw new FileSystemException("vfs.provider.ftp/list-not-entered.error", getName());
+        }
 
         // VFS-210. The map is never null, so an empty map is the folder with no entry.
         if (childMap.isEmpty()) {
@@ -878,6 +932,601 @@ public class FtpFileObject extends AbstractFileObject<FtpFileSystem> {
     /**
      * @throws FileSystemException if an error occurs.
      */
+    // The few bytes of a probe file of the replace test.
+    private static final byte[] PROBE_CONTENT = "probe".getBytes(StandardCharsets.US_ASCII);
+
+    // The listing with the guard of the option -a. The option is trusted only after one listing with it gave an entry
+    // on this file system. Until then an empty listing with the option is followed by one plain listing. When the
+    // change back of that empty listing was refused, the caller runs the plain listing on a fresh client.
+    private Listing checkedListing(final FtpClient client, final String path) throws IOException {
+        final Listing hidden = client.listChecked(path, true);
+        final FTPFile[] entries = hidden.getEntries();
+        if (entries == null) {
+            return hidden;
+        }
+        if (countOf(entries) > 0) {
+            if (!hidden.isBackRefused()) {
+                getAbstractFileSystem().markHiddenOptionSeen();
+            }
+            return hidden;
+        }
+        if (hidden.isBackRefused() || getAbstractFileSystem().isHiddenOptionSeen()) {
+            return hidden;
+        }
+        return client.listChecked(path, false);
+    }
+
+    // An empty listing with the option -a whose change back was refused, while the option is not trusted. It does not
+    // show that a visible name is missing. The plain listing is still needed.
+    private boolean needsPlainListing(final Listing listing) {
+        final FTPFile[] entries = listing.getEntries();
+        return entries != null && countOf(entries) == 0 && listing.isBackRefused()
+                && !getAbstractFileSystem().isHiddenOptionSeen();
+    }
+
+    // The names of a listing. The entries "." and ".." are not names in the folder.
+    private static int countOf(final FTPFile[] entries) {
+        int count = 0;
+        for (final FTPFile entry : entries) {
+            if (entry != null && !".".equals(entry.getName()) && !"..".equals(entry.getName())) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    private FileSystemException listFailure(final String path, final Reply reply) {
+        final FileSystemException error = new FileSystemException("vfs.provider.ftp/list-reply.error",
+                path == null ? "." : path, reply.getText());
+        error.setFault(faultOf(reply.getCode(), true));
+        return error;
+    }
+
+    // One call of AtomicOps. A client whose call ended with an I/O error is discarded at once, and the call makes no
+    // further command on any client. A client whose change back was refused is not used again, and the next command
+    // of the call gets a fresh client.
+    private final class AtomicCall {
+
+        private final FtpFileSystem fileSystem = getAbstractFileSystem();
+
+        private FtpClient client;
+
+        private boolean backRefused;
+
+        private boolean lost;
+
+        private final List<String> leftovers = new ArrayList<>();
+
+        private boolean connectionLost;
+
+        FtpClient client() throws FileSystemException {
+            if (client != null && backRefused) {
+                fileSystem.discardClient(client);
+                client = null;
+                backRefused = false;
+            }
+            if (client == null) {
+                client = fileSystem.getClient();
+            }
+            return client;
+        }
+
+        <T> T run(final FtpCall<T> call) throws IOException {
+            final FtpClient current = client();
+            try {
+                return call.run(current);
+            } catch (final IOException e) {
+                fileSystem.discardClient(current);
+                client = null;
+                lost = true;
+                throw e;
+            }
+        }
+
+        void noteBack(final boolean refused) {
+            backRefused |= refused;
+        }
+
+        void discard() {
+            if (client != null) {
+                fileSystem.discardClient(client);
+                client = null;
+            }
+            lost = true;
+        }
+
+        void end() {
+            if (client != null) {
+                if (backRefused) {
+                    fileSystem.discardClient(client);
+                } else {
+                    fileSystem.putClient(client);
+                }
+                client = null;
+            }
+        }
+
+        // Sends DELE. False when the server refused it with a reply. A transport reply retires the client and is an
+        // I/O error.
+        boolean delete(final String path) throws IOException {
+            if (run(c -> c.deleteFile(path))) {
+                return true;
+            }
+            final Reply reply = run(c -> new Reply(c.getReplyCode(), String.valueOf(c.getReplyString()).trim()));
+            if (isTransport(reply)) {
+                discard();
+                final FileSystemException error = new FileSystemException("vfs.provider.ftp/delete-file-reply.error",
+                        path, textOf(reply));
+                error.setFault(Fault.TRANSPORT);
+                throw error;
+            }
+            return false;
+        }
+
+        // A transport reply to RNFR or RNTO in a rename of two steps. The client is retired. The reply means that the
+        // command did not run, so the replies decide the outcome. The test of the replace answer decides nothing.
+        void checkRename(final RenameReplies replies, final String from, final String to) throws IOException {
+            final Reply reply = isTransport(replies.getFrom()) ? replies.getFrom()
+                    : isTransport(replies.getTo()) ? replies.getTo() : null;
+            if (reply != null) {
+                discard();
+                final FileSystemException error = new FileSystemException("vfs.provider.ftp/rename-file-reply.error",
+                        from, to, textOf(reply));
+                error.setFault(Fault.TRANSPORT);
+                throw error;
+            }
+        }
+
+        // Removes a name. A name that the server did not remove is a leftover.
+        void remove(final String path) {
+            if (lost) {
+                leftovers.add(path);
+                return;
+            }
+            try {
+                if (!delete(path)) {
+                    leftovers.add(path);
+                }
+            } catch (final IOException e) {
+                connectionLost = true;
+                leftovers.add(path);
+            }
+        }
+
+        AtomicResult result(final AtomicOutcome outcome, final String detail) {
+            return new AtomicResult(outcome, detail, leftovers, connectionLost);
+        }
+
+        // A transport reply to the rename of the call. The command did not run, so nothing changed. The client is
+        // retired and the call sends no further command.
+        AtomicResult refusedByTransport(final Reply reply) {
+            discard();
+            connectionLost = true;
+            return result(AtomicOutcome.REFUSED, textOf(reply));
+        }
+
+        // The rename ended with an I/O error. The client is discarded, and the rename may have worked.
+        UnclearResultException notKnown(final String step, final IOException cause, final MovePhase phase,
+                final String tempPath) {
+            discard();
+            return new UnclearResultException("vfs.provider/atomic-not-known.error", cause, phase, tempPath, false,
+                    step, getName().getFriendlyURI());
+        }
+    }
+
+    // 421, 425 and 426 are transport replies.
+    private static boolean isTransport(final Reply reply) {
+        return reply != null && faultOf(reply.getCode(), false) == Fault.TRANSPORT;
+    }
+
+    private static FtpFileObject ftpOf(final FileObject file) throws FileSystemException {
+        return (FtpFileObject) FileObjectUtils.getAbstractFileObject(file);
+    }
+
+    private static String parentOf(final String path) {
+        final int slash = path.lastIndexOf('/');
+        return slash <= 0 ? null : path.substring(0, slash);
+    }
+
+    private static String baseOf(final String path) {
+        return path.substring(path.lastIndexOf('/') + 1);
+    }
+
+    // The folder of a name. A root has no parent, so it is its own folder.
+    private static String folderKey(final FileName name) {
+        final FileName parent = name.getParent();
+        return (parent == null ? name : parent).getPath();
+    }
+
+    private static String textOf(final Reply reply) {
+        return reply == null ? null : reply.getText();
+    }
+
+    private Answer replaceAnswer(final String folder) {
+        final ReplaceState state = getAbstractFileSystem().getReplaceState(folder);
+        return state == ReplaceState.REPLACES ? Answer.YES
+                : state == ReplaceState.NO_REPLACE ? Answer.NO : Answer.NOT_KNOWN;
+    }
+
+    @Override
+    public AtomicCapabilities atomicCapabilities() {
+        return new AtomicCapabilities(Answer.NO, Answer.NO, replaceAnswer(folderKey(getName())));
+    }
+
+    @Override
+    public AtomicCapabilities atomicCapabilities(final FileObject target) {
+        return new AtomicCapabilities(Answer.NO, Answer.NO, replaceAnswer(folderKey(target.getName())));
+    }
+
+    // FTP has no exclusive call.
+    @Override
+    public AtomicResult createExclusive(final byte[] content, final String scratchName, final String probeName) {
+        return new AtomicResult(AtomicOutcome.UNSUPPORTED, null);
+    }
+
+    @Override
+    public AtomicResult linkExclusive(final FileObject target, final String probeName) {
+        return new AtomicResult(AtomicOutcome.UNSUPPORTED, null);
+    }
+
+    @Override
+    public AtomicResult publishExclusive(final FileObject target, final String probeName) {
+        return new AtomicResult(AtomicOutcome.UNSUPPORTED, null);
+    }
+
+    // The look at a name: MDTM by name where the server lists MDTM, then a fresh checked listing of the parent. It
+    // never opens the file and never changes into the name. The root is taken as there.
+    private boolean lookNow(final AtomicCall call, final String path) throws IOException {
+        if (path == null) {
+            return true;
+        }
+        if (call.run(c -> c.hasFeature("MDTM"))
+                && call.run(c -> c.mdtmReply(path)).getCode() == FTPReply.FILE_STATUS) {
+            return true;
+        }
+        return listingLook(call, path) != null;
+    }
+
+    // The entry of the name in a fresh checked listing of its parent. Null when that listing is complete without the
+    // name, or when the parent is not there. An error never counts as "not there".
+    private FTPFile listingLook(final AtomicCall call, final String path) throws IOException {
+        final String parent = parentOf(path);
+        final String name = baseOf(path);
+        Listing listing = call.run(c -> checkedListing(c, parent));
+        call.noteBack(listing.isBackRefused());
+        if (needsPlainListing(listing)) {
+            // The next command of the call takes a fresh client, because the change back was refused.
+            listing = call.run(c -> c.listChecked(parent, false));
+            call.noteBack(listing.isBackRefused());
+        }
+        if (listing.getFailure() != null) {
+            throw listFailure(parent, listing.getFailure());
+        }
+        final FTPFile[] entries = listing.getEntries();
+        if (entries != null) {
+            for (final FTPFile entry : entries) {
+                if (entry != null && name.equals(entry.getName())) {
+                    return entry;
+                }
+            }
+            // A good reply with no entry does not prove that the server opened the folder.
+            if (countOf(entries) > 0 || listing.isEntered()) {
+                return null;
+            }
+            final Change control = call.run(c -> c.enterAndBack(parent));
+            call.noteBack(control.isBackRefused());
+            if (control.isEntered()) {
+                return null;
+            }
+        }
+        // The parent can not be entered. Nothing can be below a folder that is not there.
+        if (!lookNow(call, parent)) {
+            return null;
+        }
+        throw applicationError("vfs.provider/look-not-entered.error", parent);
+    }
+
+    private FileSystemException lookError(final IOException error) {
+        if (error instanceof FileSystemException) {
+            return (FileSystemException) error;
+        }
+        final FileSystemException wrapped = new FileSystemException("vfs.provider/look.error", error,
+                getName().getFriendlyURI());
+        wrapped.setFault(Faults.of(error));
+        return wrapped;
+    }
+
+    // A look that has no answer for a reason of the server, the folder or the name. It is an application error.
+    private static FileSystemException applicationError(final String code, final Object name) {
+        final FileSystemException error = new FileSystemException(code, name);
+        error.setFault(Fault.APPLICATION);
+        return error;
+    }
+
+    @Override
+    public boolean existsNow() throws FileSystemException {
+        final AtomicCall call = new AtomicCall();
+        try {
+            return lookNow(call, relPath);
+        } catch (final IOException e) {
+            throw lookError(e);
+        } finally {
+            call.end();
+        }
+    }
+
+    @Override
+    public boolean folderExistsNow() throws FileSystemException {
+        final AtomicCall call = new AtomicCall();
+        try {
+            final Change change = call.run(c -> c.enterAndBack(relPath));
+            call.noteBack(change.isBackRefused());
+            if (change.isEntered()) {
+                return true;
+            }
+            // The refusal does not say whether the folder is missing or closed to the account.
+            if (!lookNow(call, relPath)) {
+                return false;
+            }
+            throw applicationError("vfs.provider/look-not-entered.error", getName().getFriendlyURI());
+        } catch (final IOException e) {
+            throw lookError(e);
+        } finally {
+            call.end();
+        }
+    }
+
+    // SIZE in the type ASCII is the size of the transfer, so the values by name are read only in the type BINARY.
+    private boolean isBinary() {
+        final FtpFileType type = FtpFileSystemConfigBuilder.getInstance()
+                .getFileType(getAbstractFileSystem().getClientOptions());
+        return type == null || type == FtpFileType.BINARY;
+    }
+
+    private static Long sizeOf(final Reply reply) {
+        if (reply.getCode() != FTPReply.FILE_STATUS) {
+            return null;
+        }
+        try {
+            return Long.valueOf(reply.getText().trim());
+        } catch (final NumberFormatException e) {
+            return null;
+        }
+    }
+
+    // The time of MDTM, read as UTC with the parser of commons net.
+    private static Long timeOf(final Reply reply) {
+        if (reply.getCode() != FTPReply.FILE_STATUS) {
+            return null;
+        }
+        final Calendar time = MLSxEntryParser.parseGMTdateTime(reply.getText().trim());
+        return time == null ? null : Long.valueOf(time.getTimeInMillis());
+    }
+
+    @Override
+    public StatNow statNow() throws FileSystemException {
+        if (relPath == null) {
+            throw applicationError("vfs.provider/look-no-size.error", getName().getFriendlyURI());
+        }
+        final AtomicCall call = new AtomicCall();
+        try {
+            final boolean mdtmListed = call.run(c -> c.hasFeature("MDTM"));
+            boolean mdtmSent = false;
+            boolean mdtmShown = false;
+            if (isBinary() && mdtmListed && call.run(c -> c.hasFeature("SIZE"))) {
+                final Reply size = call.run(c -> c.sizeReply(relPath));
+                final Reply mdtm = call.run(c -> c.mdtmReply(relPath));
+                mdtmSent = true;
+                mdtmShown = mdtm.getCode() == FTPReply.FILE_STATUS;
+                final Long bytes = sizeOf(size);
+                final Long time = timeOf(mdtm);
+                if (bytes != null && time != null) {
+                    return StatNow.there(bytes, time, false);
+                }
+            }
+            final FTPFile entry = listingLook(call, relPath);
+            if (entry != null) {
+                final Calendar time = entry.getTimestamp();
+                return StatNow.there(entry.getSize(), time == null ? 0 : time.getTimeInMillis(), true);
+            }
+            if (mdtmListed && !mdtmSent) {
+                mdtmShown = call.run(c -> c.mdtmReply(relPath)).getCode() == FTPReply.FILE_STATUS;
+            }
+            if (!mdtmShown) {
+                return StatNow.notThere();
+            }
+            final String folder = parentOf(relPath) == null ? "." : parentOf(relPath);
+            if (getAbstractFileSystem().firstWarning("hides " + folder)) {
+                log.warn("The FTP server hides names from the listing of the folder \"" + folder
+                        + "\". MDTM shows \"" + baseOf(relPath) + "\", and LIST -a does not.");
+            }
+            throw applicationError("vfs.provider/look-no-size.error", getName().getFriendlyURI());
+        } catch (final IOException e) {
+            throw lookError(e);
+        } finally {
+            call.end();
+        }
+    }
+
+    @Override
+    public AtomicResult renameReplacing(final FileObject target, final FileObject probeA, final FileObject probeB)
+            throws FileSystemException {
+        final String targetPath = ftpOf(target).relPath;
+        final AtomicCall call = new AtomicCall();
+        try {
+            final RenameReplies replies;
+            try {
+                replies = call.run(c -> c.renameSteps(relPath, targetPath));
+            } catch (final IOException e) {
+                throw call.notKnown("replacing rename", e, MovePhase.COMMIT, getName().getPath());
+            }
+            if (replies.getTo() == null) {
+                if (isTransport(replies.getFrom())) {
+                    return call.refusedByTransport(replies.getFrom());
+                }
+                // RNTO was not sent, so the target is not the reason.
+                return lookAfterRefusal(call, relPath, textOf(replies.getFrom()));
+            }
+            if (FTPReply.isPositiveCompletion(replies.getTo().getCode())) {
+                return call.result(AtomicOutcome.DONE, null);
+            }
+            if (isTransport(replies.getTo())) {
+                return call.refusedByTransport(replies.getTo());
+            }
+            final String refusal = textOf(replies.getTo());
+            final boolean targetThere;
+            try {
+                targetThere = lookNow(call, targetPath);
+            } catch (final IOException e) {
+                // The refusal was a reply, so nothing changed.
+                call.connectionLost |= Faults.isTransport(e);
+                return call.result(AtomicOutcome.REFUSED, refusal);
+            }
+            if (!targetThere) {
+                return call.result(AtomicOutcome.REFUSED, refusal);
+            }
+            final String folder = folderKey(target.getName());
+            final ReplaceState state = getAbstractFileSystem().getReplaceState(folder);
+            if (state == ReplaceState.REPLACES) {
+                return call.result(AtomicOutcome.REFUSED, refusal);
+            }
+            if (state == ReplaceState.NO_REPLACE) {
+                return call.result(AtomicOutcome.UNSUPPORTED, refusal);
+            }
+            if (probeA == null || probeB == null) {
+                return call.result(AtomicOutcome.REFUSED, refusal);
+            }
+            return replaceTest(call, refusal, ftpOf(probeA).relPath, ftpOf(probeB).relPath, folder);
+        } finally {
+            call.end();
+        }
+    }
+
+    // After a refused RNFR: GONE when a look shows the name gone, else REFUSED. A look that throws does not change
+    // the outcome.
+    private AtomicResult lookAfterRefusal(final AtomicCall call, final String path, final String refusal) {
+        try {
+            return call.result(lookNow(call, path) ? AtomicOutcome.REFUSED : AtomicOutcome.GONE, refusal);
+        } catch (final IOException e) {
+            call.connectionLost |= Faults.isTransport(e);
+            return call.result(AtomicOutcome.REFUSED, refusal);
+        }
+    }
+
+    // Does this server refuse a rename only because the target exists. It touches only the two probe files.
+    private AtomicResult replaceTest(final AtomicCall call, final String refusal, final String probeA,
+            final String probeB, final String folder) {
+        try {
+            for (final String probe : new String[] {probeA, probeB}) {
+                if (!store(call, probe)) {
+                    call.remove(probeA);
+                    if (probe == probeB) {
+                        call.remove(probeB);
+                    }
+                    return call.result(AtomicOutcome.REFUSED, refusal);
+                }
+            }
+            final RenameReplies test = call.run(c -> c.renameSteps(probeA, probeB));
+            call.checkRename(test, probeA, probeB);
+            if (test.getTo() == null) {
+                // A refused RNFR inside the test decides nothing.
+                call.remove(probeA);
+                call.remove(probeB);
+                return call.result(AtomicOutcome.REFUSED, refusal);
+            }
+            if (FTPReply.isPositiveCompletion(test.getTo().getCode())) {
+                call.remove(probeB);
+                getAbstractFileSystem().markReplaces(folder);
+                return call.result(AtomicOutcome.REFUSED, refusal);
+            }
+            // The control: the same rename with only the existing target taken away.
+            if (!call.delete(probeB)) {
+                call.leftovers.add(probeB);
+                call.remove(probeA);
+                return call.result(AtomicOutcome.REFUSED, refusal);
+            }
+            final RenameReplies control = call.run(c -> c.renameSteps(probeA, probeB));
+            call.checkRename(control, probeA, probeB);
+            if (control.getTo() == null || !FTPReply.isPositiveCompletion(control.getTo().getCode())) {
+                call.remove(probeA);
+                return call.result(AtomicOutcome.REFUSED, refusal);
+            }
+            call.remove(probeB);
+            getAbstractFileSystem().markNoReplace(folder);
+            if (getAbstractFileSystem().firstWarning("replace " + folder)) {
+                log.warn("The FTP server does not replace an existing name on a rename in the folder \"" + folder
+                        + "\". The replace test on two probe files showed it.");
+            }
+            return call.result(AtomicOutcome.UNSUPPORTED, refusal);
+        } catch (final IOException e) {
+            // A transport error in the test decides nothing and remembers nothing.
+            call.discard();
+            call.connectionLost = true;
+            call.leftovers.add(probeA);
+            call.leftovers.add(probeB);
+            return call.result(AtomicOutcome.REFUSED, refusal);
+        }
+    }
+
+    // Writes a probe file. False when the server refused it by a reply. A transport reply is an I/O error.
+    private boolean store(final AtomicCall call, final String path) throws IOException {
+        final OutputStream out = call.run(c -> c.storeFileStream(path));
+        if (out == null) {
+            transportReply(call);
+            return false;
+        }
+        try {
+            out.write(PROBE_CONTENT);
+            out.close();
+        } catch (final IOException e) {
+            call.discard();
+            throw e;
+        }
+        if (!call.run(c -> c.completePendingCommand())) {
+            transportReply(call);
+            return false;
+        }
+        return true;
+    }
+
+    private static void transportReply(final AtomicCall call) throws IOException {
+        final int reply = call.run(c -> c.getReplyCode());
+        if (faultOf(reply, false) == Fault.TRANSPORT) {
+            call.discard();
+            final FileSystemException error = new FileSystemException("vfs.provider.ftp/output-error.debug",
+                    "probe", String.valueOf(reply));
+            error.setFault(Fault.TRANSPORT);
+            throw error;
+        }
+    }
+
+    @Override
+    public AtomicResult takeAway(final FileObject awayTarget) throws FileSystemException {
+        final String awayPath = ftpOf(awayTarget).relPath;
+        final AtomicCall call = new AtomicCall();
+        try {
+            final RenameReplies replies;
+            try {
+                replies = call.run(c -> c.renameSteps(relPath, awayPath));
+            } catch (final IOException e) {
+                throw call.notKnown("take away", e, MovePhase.RENAME, null);
+            }
+            if (replies.getTo() == null) {
+                if (isTransport(replies.getFrom())) {
+                    return call.refusedByTransport(replies.getFrom());
+                }
+                return lookAfterRefusal(call, relPath, textOf(replies.getFrom()));
+            }
+            if (isTransport(replies.getTo())) {
+                return call.refusedByTransport(replies.getTo());
+            }
+            return call.result(FTPReply.isPositiveCompletion(replies.getTo().getCode()) ? AtomicOutcome.DONE
+                    : AtomicOutcome.REFUSED, textOf(replies.getTo()));
+        } finally {
+            call.end();
+        }
+    }
+
     @Override
     public void refresh() throws FileSystemException {
         if (inRefresh.compareAndSet(false, true)) {

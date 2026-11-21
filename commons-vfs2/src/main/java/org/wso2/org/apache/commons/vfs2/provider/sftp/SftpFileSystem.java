@@ -25,6 +25,9 @@ import java.util.Arrays;
 import java.util.Collection;
 import java.util.List;
 import java.util.Objects;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -71,6 +74,39 @@ public class SftpFileSystem extends AbstractFileSystem {
     private static final String ABORT_REASON = "The SFTP file system was aborted";
 
     private static final long LAST_MOD_TIME_ACCURACY = 1000L;
+
+    static final String HARDLINK = "hardlink@openssh.com";
+
+    static final String POSIX_RENAME = "posix-rename@openssh.com";
+
+    // The value of an extension that the server announces.
+    static final String ANNOUNCED = "1";
+
+    // A folder key that is not in its map is not known.
+    enum LinkState {
+        LINKS, NO_LINK
+    }
+
+    enum ReplaceState {
+        REPLACES, NO_REPLACE
+    }
+
+    // The folders and folder pairs that a WARN was logged for, in this copy of the fork, so a new file system for the
+    // same folder does not log it again.
+    private static final Set<String> WARNED = ConcurrentHashMap.newKeySet();
+
+    // The link state per folder key: the folder of a name for an exclusive create, the pair of the source folder and
+    // the target folder for a link. "Links" never changes again.
+    private final ConcurrentMap<String, LinkState> linkStates = new ConcurrentHashMap<>();
+
+    // The replace state per target folder, used only on a server that does not announce the posix rename. "Replaces"
+    // never changes again.
+    private final ConcurrentMap<String, ReplaceState> replaceStates = new ConcurrentHashMap<>();
+
+    // What the server announced when the last channel started. Null before the first channel.
+    private volatile Boolean hardlinkAnnounced;
+
+    private volatile Boolean posixRenameAnnounced;
 
     /**
      * A session and the group of its sockets. They are published together, so the discard of one session never aborts
@@ -436,6 +472,8 @@ public class SftpFileSystem extends AbstractFileSystem {
         try {
             final ChannelSftp channel = (ChannelSftp) current.openChannel("sftp");
             channel.connect(channelOpenMillis);
+            hardlinkAnnounced = ANNOUNCED.equals(channel.getExtension(HARDLINK));
+            posixRenameAnnounced = ANNOUNCED.equals(channel.getExtension(POSIX_RENAME));
             return channel;
         } catch (final JSchException e) {
             discardSession(current);
@@ -813,6 +851,46 @@ public class SftpFileSystem extends AbstractFileSystem {
      *
      * @param channelSftp the SFTP channel.
      */
+    Boolean isHardlinkAnnounced() {
+        return hardlinkAnnounced;
+    }
+
+    Boolean isPosixRenameAnnounced() {
+        return posixRenameAnnounced;
+    }
+
+    LinkState getLinkState(final String key) {
+        return linkStates.get(key);
+    }
+
+    void markLinks(final String key) {
+        linkStates.put(key, LinkState.LINKS);
+    }
+
+    // A key that links keeps that state.
+    void markNoLink(final String key) {
+        linkStates.putIfAbsent(key, LinkState.NO_LINK);
+    }
+
+    ReplaceState getReplaceState(final String folder) {
+        return replaceStates.get(folder);
+    }
+
+    void markReplaces(final String folder) {
+        replaceStates.put(folder, ReplaceState.REPLACES);
+    }
+
+    // A folder that replaces keeps that state.
+    void markNoReplace(final String folder) {
+        replaceStates.putIfAbsent(folder, ReplaceState.NO_REPLACE);
+    }
+
+    // True only for the first WARN about this subject on this server in this copy of the fork.
+    boolean firstWarning(final String subject) {
+        final GenericFileName root = (GenericFileName) getRootName();
+        return WARNED.add(root.getHostName() + ":" + root.getPort() + " " + subject);
+    }
+
     protected void putChannel(final ChannelSftp channelSftp) {
         handedOut.decrementAndGet();
         if (!isFileSystemClosed && idleChannel == null && isUp(channelSftp) && isCurrent(channelSftp)) {
