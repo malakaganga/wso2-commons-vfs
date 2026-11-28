@@ -17,6 +17,8 @@
  */
 package org.wso2.org.apache.commons.vfs2.provider;
 
+import java.io.IOException;
+import java.io.OutputStream;
 import java.util.Map;
 
 import org.wso2.org.apache.commons.vfs2.FileName;
@@ -125,6 +127,19 @@ public interface AtomicOps {
      */
     default StatNow statAfterProbe() throws FileSystemException {
         return statNow();
+    }
+
+    /**
+     * Writes the whole content of this file in a folder that the caller knows to be there. A provider whose plain write
+     * looks at the parent folder first may skip that look and nothing else.
+     *
+     * @param content the content.
+     * @throws IOException if the write fails.
+     */
+    default void writeInKnownFolder(final byte[] content) throws IOException {
+        try (OutputStream output = ((FileObject) this).getContent().getOutputStream(false)) {
+            output.write(content);
+        }
     }
 
     /**

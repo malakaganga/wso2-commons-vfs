@@ -394,7 +394,16 @@ public final class ShareLock {
                 return contention();
             }
             if (created == AtomicOutcome.UNSUPPORTED) {
-                call(CallType.CHANGE, () -> { io.write(handle.lockUri, handle.entry.value.bytes); return null; });
+                // The listener saw the file in its folder, by the listing or by the look above, so the folder of the
+                // lock is there. A writer may lock a name in a folder that the write of the lock still has to make.
+                call(CallType.CHANGE, () -> {
+                    if (mode == Mode.LISTENER) {
+                        io.writeInKnownFolder(handle.lockUri, handle.entry.value.bytes);
+                    } else {
+                        io.write(handle.lockUri, handle.entry.value.bytes);
+                    }
+                    return null;
+                });
                 final LockOutcome first = readBack(io, handle);
                 if (first.kind != OURS) {
                     return first;

@@ -95,6 +95,8 @@ class ShareLockTest {
             return new AtomicResult(files.putIfAbsent(uri + ".lock", value.bytes) == null ? AtomicOutcome.DONE : AtomicOutcome.EXISTS,null);
         }
         @Override void write(String uri, byte[] value) throws IOException { calls++; files.put(uri, value); }
+        int knownWrites;
+        @Override void writeInKnownFolder(String uri, byte[] value) throws IOException { knownWrites++; write(uri, value); }
         @Override void delete(String uri) throws IOException { calls++; deletes++; files.remove(uri); }
         @Override AtomicOutcome take(String from, String to) throws IOException {
             calls++;
@@ -107,6 +109,23 @@ class ShareLockTest {
 
     private LockOutcome acquire(LockIo io) {
         return owner.acquire(io, data, ShareLock.Mode.WRITER, null);
+    }
+
+    // The weak rule writes the lock of a listener in its known folder. A writer may lock a name whose folder the write
+    // of the lock has to make, so it keeps the plain write.
+    @Test
+    void onlyAListenerWritesItsWeakLockInAKnownFolder() {
+        server.weak = true;
+        server.files.put(data, bytes("data"));
+        LockOutcome listener = owner.acquire(server, data, ShareLock.Mode.LISTENER, null);
+        assertEquals(ACQUIRED, listener.kind);
+        assertEquals(1, server.knownWrites);
+        assertEquals(RELEASED, listener.handle.releaseChecked(server).kind);
+        Server writer = new Server();
+        writer.weak = true;
+        assertEquals(ACQUIRED, acquire(writer).kind);
+        assertEquals(0, writer.knownWrites);
+        assertTrue(writer.files.containsKey(data + ".lock"));
     }
 
     @Test

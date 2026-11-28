@@ -74,6 +74,17 @@
       <artifactId>bcprov-jdk16</artifactId>
       <scope>test</scope>
     </dependency>
+    <!-- The embedded FTP server of the core tests, and the FTP client the provider needs -->
+    <dependency>
+      <groupId>org.apache.ftpserver</groupId>
+      <artifactId>ftpserver-core</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>commons-net</groupId>
+      <artifactId>commons-net</artifactId>
+      <scope>test</scope>
+    </dependency>
     <!-- The LRU files cache of the connector -->
     <dependency>
       <groupId>org.apache.commons</groupId>

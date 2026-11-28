@@ -23,6 +23,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.wso2.vfs.shared.lock.LockOutcome.Kind.ACQUIRED;
 
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.UUID;
@@ -104,6 +105,18 @@ class LockViewTest {
         try (Stream<Path> files = Files.list(folder)) {
             assertEquals(2, files.count());
         }
+    }
+
+    // The write of a lock in a known folder writes the whole content and replaces an older one, as the plain write.
+    @Test
+    void aWriteInAKnownFolderWritesTheWholeContent() throws Exception {
+        final LockIo io = new LockIo(manager, null);
+        final String lock = folder.resolve("f.dat.lock").toUri().toString();
+        io.writeInKnownFolder(lock, "a longer first value".getBytes(StandardCharsets.UTF_8));
+        assertArrayEquals("a longer first value".getBytes(StandardCharsets.UTF_8),
+                Files.readAllBytes(folder.resolve("f.dat.lock")));
+        io.writeInKnownFolder(lock, "second".getBytes(StandardCharsets.UTF_8));
+        assertArrayEquals("second".getBytes(StandardCharsets.UTF_8), Files.readAllBytes(folder.resolve("f.dat.lock")));
     }
 
     private interface Resolve {

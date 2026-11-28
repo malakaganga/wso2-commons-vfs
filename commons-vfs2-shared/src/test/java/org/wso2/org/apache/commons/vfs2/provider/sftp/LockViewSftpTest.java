@@ -26,6 +26,7 @@ import static org.wso2.vfs.shared.lock.LockOutcome.Kind.ACQUIRED;
 import static org.wso2.vfs.shared.lock.LockOutcome.Kind.BUSY_SHARE;
 import static org.wso2.vfs.shared.lock.LockOutcome.Kind.FILE_GONE;
 
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.List;
@@ -44,6 +45,7 @@ import org.wso2.org.apache.commons.vfs2.FileSystemOptions;
 import org.wso2.org.apache.commons.vfs2.cache.LRUFilesCache;
 import org.wso2.org.apache.commons.vfs2.cache.NullFilesCache;
 import org.wso2.org.apache.commons.vfs2.impl.StandardFileSystemManager;
+import org.wso2.org.apache.commons.vfs2.provider.AtomicOps;
 import org.wso2.vfs.shared.failstate.FailStateStore;
 import org.wso2.vfs.shared.health.EndpointHealth;
 import org.wso2.vfs.shared.health.HealthRegistry;
@@ -280,6 +282,22 @@ class LockViewSftpTest {
         Files.delete(server.getRoot().resolve("data/new.txt.lock"));
         assertEquals(ACQUIRED, locks.acquire(io, data, ShareLock.Mode.WRITER, null).kind);
         assertTrue(Files.exists(server.getRoot().resolve("data/new.txt.lock")));
+    }
+
+    // The write of a lock in a known folder writes the whole content and replaces an older one, as the plain write.
+    @Test
+    void aWriteInAKnownFolderWritesTheWholeContent() throws Exception {
+        Files.createDirectories(server.getRoot().resolve("data"));
+        try (FileObject file = manager.resolveFile(server.uri("data/f.txt.lock"), options)) {
+            AtomicOps.of(file).writeInKnownFolder("a longer first value".getBytes(StandardCharsets.UTF_8));
+        }
+        assertEquals("a longer first value", new String(Files.readAllBytes(server.getRoot().resolve("data/f.txt.lock")),
+                StandardCharsets.UTF_8));
+        try (FileObject file = manager.resolveFile(server.uri("data/f.txt.lock"), options)) {
+            AtomicOps.of(file).writeInKnownFolder("second".getBytes(StandardCharsets.UTF_8));
+        }
+        assertEquals("second", new String(Files.readAllBytes(server.getRoot().resolve("data/f.txt.lock")),
+                StandardCharsets.UTF_8));
     }
 
     // The stats and lstats of a path.

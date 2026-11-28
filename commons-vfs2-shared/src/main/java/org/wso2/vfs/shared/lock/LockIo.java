@@ -134,6 +134,20 @@ public class LockIo {
         }
     }
 
+    // The write of a lock whose folder the caller saw a moment ago. A provider may skip the look at the folder.
+    void writeInKnownFolder(final String uri, final byte[] bytes) throws IOException {
+        try (FileObject file = resolve(uri)) {
+            final AtomicOps ops = AtomicOps.of(file);
+            if (ops != null) {
+                ops.writeInKnownFolder(bytes);
+                return;
+            }
+            try (OutputStream output = file.getContent().getOutputStream(false)) {
+                output.write(bytes);
+            }
+        }
+    }
+
     void delete(final String uri) throws IOException {
         try (FileObject file = resolve(uri)) {
             if (!file.delete() && AtomicOps.existsNow(file)) {
