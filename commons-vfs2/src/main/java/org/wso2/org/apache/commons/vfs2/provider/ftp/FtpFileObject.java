@@ -1636,6 +1636,19 @@ public class FtpFileObject extends AbstractFileObject<FtpFileSystem> implements 
         }
     }
 
+    // The parent object takes a folder entry, as the root does, so the plain write sends no listing of the folder
+    // above. The look at this name before the STOR and the listing after it stay.
+    @Override
+    public void writeInKnownFolder(final byte[] content) throws IOException {
+        final FtpFileObject parent = (FtpFileObject) FileObjectUtils.getAbstractFileObject(getParent());
+        if (parent != null) {
+            final FTPFile folder = new FTPFile();
+            folder.setType(FTPFile.DIRECTORY_TYPE);
+            parent.takeEntry(folder);
+        }
+        AtomicOps.super.writeInKnownFolder(content);
+    }
+
     @Override
     public void refresh() throws FileSystemException {
         if (inRefresh.compareAndSet(false, true)) {
