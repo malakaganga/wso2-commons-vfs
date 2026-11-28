@@ -116,6 +116,18 @@ public interface AtomicOps {
     StatNow statNow() throws FileSystemException;
 
     /**
+     * Looks at this name for a caller that has just resolved it with a probe, and reads its size and its modified
+     * time. A provider whose probe reads the same record as {@link #statNow()} may answer from the record of that
+     * probe, when the probe attached this object and no files cache keeps it. The default asks the server.
+     *
+     * @return the answer.
+     * @throws FileSystemException for every failure that is not a definite "not there", with its fault.
+     */
+    default StatNow statAfterProbe() throws FileSystemException {
+        return statNow();
+    }
+
+    /**
      * Creates this name with the content. Fails when the name exists.
      *
      * @param content the content.

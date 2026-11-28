@@ -48,7 +48,8 @@ public final class FileDigest {
                 }
                 return StatNow.there(file.getContent().getSize(), file.getContent().getLastModifiedTime(), false);
             }
-            return ops.statNow();
+            // The resolve just probed the name. A provider may answer from the record of that probe.
+            return ops.statAfterProbe();
         }
     }
 

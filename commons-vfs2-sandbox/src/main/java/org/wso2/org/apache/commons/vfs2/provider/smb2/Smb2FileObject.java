@@ -30,6 +30,7 @@ import org.wso2.org.apache.commons.vfs2.FileName;
 import org.wso2.org.apache.commons.vfs2.FileObject;
 import org.wso2.org.apache.commons.vfs2.FileSystemException;
 import org.wso2.org.apache.commons.vfs2.FileType;
+import org.wso2.org.apache.commons.vfs2.cache.NullFilesCache;
 import org.wso2.org.apache.commons.vfs2.provider.AbstractFileName;
 import org.wso2.org.apache.commons.vfs2.provider.AbstractFileObject;
 import org.wso2.org.apache.commons.vfs2.provider.AtomicCapabilities;
@@ -79,6 +80,9 @@ public class Smb2FileObject extends AbstractFileObject<Smb2FileSystem> implement
     private static final char[] RESERVED_FILE_CHARS = {' ', '#'};
     private final String relPathToShare;
     private FileAllInformation fileInfo;
+
+    // The record above came from the server since the last detach, also when it is null for a missing name.
+    private boolean infoRead;
     private FileName rootName;
 
     /**
@@ -162,6 +166,7 @@ public class Smb2FileObject extends AbstractFileObject<Smb2FileSystem> implement
                 Throwable failure = null;
                 try {
                     fileInfo = client.getFileInfo(getRelPathToShare());
+                    infoRead = true;
                 } catch (FileSystemException | RuntimeException e) {
                     failure = e;
                     throw e;
@@ -436,6 +441,7 @@ public class Smb2FileObject extends AbstractFileObject<Smb2FileSystem> implement
     protected void doDetach() {
 
         this.fileInfo = null;
+        this.infoRead = false;
     }
 
     @Override
@@ -910,6 +916,25 @@ public class Smb2FileObject extends AbstractFileObject<Smb2FileSystem> implement
     @Override
     public StatNow statNow() throws FileSystemException {
         final FileAllInformation found = lookNow(false, null);
+        return found == null ? StatNow.notThere()
+                : StatNow.there(found.getStandardInformation().getEndOfFile(),
+                        found.getBasicInformation().getLastWriteTime().toEpochMillis(), false);
+    }
+
+    // The probe of a resolve reads the same record as statNow. With no files cache the object is new at each resolve,
+    // so a record that this object read came from the probe of its own resolve. An object with no record, or one that
+    // a files cache may keep, asks the server.
+    @Override
+    public StatNow statAfterProbe() throws FileSystemException {
+        final boolean probed;
+        final FileAllInformation found;
+        synchronized (getFileSystem()) {
+            probed = infoRead && getFileSystem().getFileSystemManager().getFilesCache() instanceof NullFilesCache;
+            found = fileInfo;
+        }
+        if (!probed) {
+            return statNow();
+        }
         return found == null ? StatNow.notThere()
                 : StatNow.there(found.getStandardInformation().getEndOfFile(),
                         found.getBasicInformation().getLastWriteTime().toEpochMillis(), false);
