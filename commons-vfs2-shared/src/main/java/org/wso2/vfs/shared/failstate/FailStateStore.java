@@ -398,10 +398,15 @@ public final class FailStateStore {
     }
 
     private Marker canonical(LockIo io, String uri, String name) throws Failure {
+        return canonical(io, io, uri, name);
+    }
+
+    // The look resolves the name of the marker, io does every later step.
+    private Marker canonical(LockIo io, LockIo look, String uri, String name) throws Failure {
         Marker marker = new Marker();
         String canonical = suffix(uri, ".fail");
         boolean present = call(ErrorClassifier.CallType.READ, () -> {
-            try (FileObject file = io.resolve(canonical)) {
+            try (FileObject file = look.resolve(canonical)) {
                 marker.listedName = file.getName().getBaseName();
                 return AtomicOps.existsNow(file);
             }
@@ -699,9 +704,9 @@ public final class FailStateStore {
         }
     }
 
-    private Reading markers(LockIo io, HeldLock held, String uri, String name) throws Failure {
+    private Reading markers(LockIo io, LockIo look, HeldLock held, String uri, String name) throws Failure {
         Reading result = new Reading();
-        result.canonical = canonical(io, uri, name);
+        result.canonical = canonical(io, look, uri, name);
         result.record = result.canonical.record;
         if (result.canonical.foreign() || result.canonical.empty) {
             return result;
@@ -786,13 +791,16 @@ public final class FailStateStore {
 
     public BeginResult beginFile(LockIo io, HeldLock held, String uri) {
         try {
-            StatNow current = stat(io, uri);
+            // The stat of the file and the look of its marker go through one view, so the marker is not probed. The
+            // look itself stays: it decides whether the file has a fail record.
+            LockIo view = io.view();
+            StatNow current = stat(view, uri);
             if (!current.isThere()) {
                 return decision(Decision.FILE_GONE, null, null);
             }
             FileIdentity id = FileIdentity.from(uri, current);
             String name = base(uri);
-            Reading found = markers(io, held, uri, name);
+            Reading found = markers(io, view, held, uri, name);
             if (found.canonical.foreign()) {
                 log.warn("The foreign fail marker blocks " + uri);
                 return decision(Decision.SKIP, id, null);

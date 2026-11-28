@@ -56,6 +56,30 @@
       <version>${project.version}</version>
       <scope>test</scope>
     </dependency>
+    <!-- The embedded SFTP server of the core tests -->
+    <dependency>
+      <groupId>org.wso2.org.apache.commons</groupId>
+      <artifactId>commons-vfs2</artifactId>
+      <version>${project.version}</version>
+      <type>test-jar</type>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.sshd</groupId>
+      <artifactId>sshd-core</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.bouncycastle</groupId>
+      <artifactId>bcprov-jdk16</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <!-- The LRU files cache of the connector -->
+    <dependency>
+      <groupId>org.apache.commons</groupId>
+      <artifactId>commons-collections4</artifactId>
+      <scope>test</scope>
+    </dependency>
   </dependencies>
 
   <properties>
@@ -69,6 +93,10 @@
         <artifactId>maven-surefire-plugin</artifactId>
         <configuration>
           <excludedGroups>${testpoints.excludedGroups}</excludedGroups>
+          <systemPropertyVariables>
+            <!-- The SFTP test server brings SLF4J with no binding. The logs of the tests stay on java.util.logging. -->
+            <org.apache.commons.logging.LogFactory>org.apache.commons.logging.impl.LogFactoryImpl</org.apache.commons.logging.LogFactory>
+          </systemPropertyVariables>
         </configuration>
       </plugin>
     </plugins>

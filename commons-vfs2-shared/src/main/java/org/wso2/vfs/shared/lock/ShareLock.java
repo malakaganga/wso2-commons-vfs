@@ -356,11 +356,16 @@ public final class ShareLock {
 
     private LockOutcome publishOnce(final LockIo io, final HeldLock handle, final Mode mode) {
         try {
-            final Answer exclusive = call(CallType.READ, () -> io.exclusive(handle.lockUri));
+            // The take asks the server through one view from the look of the capability to the create. The first
+            // resolve probes the data name, which shares its folder and so its capability with the lock name. The
+            // check, the look of the data name and the create follow with no probe. The write, the read backs and
+            // the later steps of the lock resolve as before.
+            final LockIo view = io.view();
+            final Answer exclusive = call(CallType.READ, () -> view.exclusive(handle.uri));
             if (capabilityLogged.compareAndSet(false, true) && exclusive == Answer.NO) {
                 log.warn("The server has no exclusive lock create.");
             }
-            final LockOutcome guard = check(io, handle.uri, handle);
+            final LockOutcome guard = check(view, handle.uri, handle);
             if (guard.kind != FREE) {
                 if (guard.kind == LOCKED) {
                     contention();
@@ -370,12 +375,12 @@ public final class ShareLock {
             }
             final boolean listed = exclusive == Answer.NO && !handle.takenOver && handle.listing != null
                     && handle.listing.lists(handle.uri);
-            if (mode == Mode.LISTENER && !listed && !exists(io, handle.uri)) {
+            if (mode == Mode.LISTENER && !listed && !exists(view, handle.uri)) {
                 return LockOutcome.of(FILE_GONE);
             }
             hold("sharelock.after-look", LockIo.pointKey(handle.uri));
             final long start = System.nanoTime();
-            final AtomicResult reply = create(io, handle.uri, handle.entry.value);
+            final AtomicResult reply = create(view, handle.uri, handle.entry.value);
             final AtomicOutcome created = reply.getOutcome();
             if (reply.isConnectionLost()) {
                 if (created == AtomicOutcome.EXISTS) {

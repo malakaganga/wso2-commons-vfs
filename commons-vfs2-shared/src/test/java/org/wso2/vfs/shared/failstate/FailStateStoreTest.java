@@ -465,6 +465,11 @@ class FailStateStoreTest {
                     String decoded = org.wso2.org.apache.commons.vfs2.provider.UriParser.decode(name);
                     return io.resolve(dir.resolve(decoded).toUri().toString());
                 }
+
+                // Each name goes through the map above, also inside one step.
+                @Override public LockIo view() {
+                    return this;
+                }
             };
             LockOutcome lock = locks.acquire(mapped, requested, ShareLock.Mode.LISTENER, folder);
             assertEquals(LockOutcome.Kind.ACQUIRED, lock.kind);

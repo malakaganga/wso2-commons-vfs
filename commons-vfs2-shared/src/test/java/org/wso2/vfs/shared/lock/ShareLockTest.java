@@ -79,6 +79,7 @@ class ShareLockTest {
         int calls;
 
         Server() { super(null, null); }
+        @Override public LockIo view() { return this; }
         @Override Answer exclusive(String uri) { return weak ? Answer.NO : Answer.YES; }
         @Override boolean exists(String uri) throws IOException { calls++; return files.containsKey(uri); }
         @Override LockValue read(String uri) throws IOException {

@@ -490,6 +490,19 @@ class AtomicWriterTest {
                 }
                 return super.resolve(ref);
             }
+
+            // The take looks at the lock name through its view.
+            @Override public LockIo view() {
+                LockIo view = super.view();
+                return new LockIo(manager, null) {
+                    @Override public FileObject resolve(String ref) throws FileSystemException {
+                        if (ref.endsWith(".lock")) {
+                            firstLook.countDown();
+                        }
+                        return view.resolve(ref);
+                    }
+                };
+            }
         };
         FutureTask<Void> release = new FutureTask<>(() -> {
             assertTrue(firstLook.await(5, TimeUnit.SECONDS));

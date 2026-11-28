@@ -20,7 +20,9 @@ package org.wso2.vfs.shared.lock;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.util.UUID;
+import org.wso2.org.apache.commons.vfs2.FileName;
 import org.wso2.org.apache.commons.vfs2.FileObject;
+import org.wso2.org.apache.commons.vfs2.FileSystem;
 import org.wso2.org.apache.commons.vfs2.FileSystemException;
 import org.wso2.org.apache.commons.vfs2.FileSystemManager;
 import org.wso2.org.apache.commons.vfs2.FileSystemOptions;
@@ -42,6 +44,32 @@ public class LockIo {
 
     public FileObject resolve(final String uri) throws FileSystemException {
         return manager.resolveFile(uri, options);
+    }
+
+    /**
+     * A view for one lock take or one look of the fail store. Its first resolve probes the name as a resolve of the
+     * manager does. That probe checks the connection and builds it again when it was dropped. Its later resolves use
+     * the file system of the first one with no probe, so each name of the step is asked once. A view is a local value
+     * of one step. It is never kept, so the next step starts with a probe again.
+     */
+    public LockIo view() {
+        final LockIo probing = this;
+        return new LockIo(manager, options) {
+            private FileSystem system;
+
+            @Override
+            public FileObject resolve(final String uri) throws FileSystemException {
+                if (system == null) {
+                    final FileObject file = probing.resolve(uri);
+                    system = file.getFileSystem();
+                    return file;
+                }
+                final FileName name = system.getFileSystemManager().resolveURI(uri);
+                // A name of another root belongs to another file system and gets a probed resolve of its own.
+                return name.getRootURI().equals(system.getRootName().getRootURI()) ? system.resolveFile(name)
+                        : probing.resolve(uri);
+            }
+        };
     }
 
     static String suffix(final String uri, final String suffix) {

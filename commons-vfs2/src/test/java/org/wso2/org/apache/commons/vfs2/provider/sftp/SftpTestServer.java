@@ -83,6 +83,21 @@ final class SftpTestServer implements Closeable {
 
     private static final Pattern NETCAT = Pattern.compile("nc -q 0 localhost (\\d+)");
 
+    // The SFTP requests whose first field is a path, by packet type.
+    private static final Map<Integer, String> NAMED = new ConcurrentHashMap<>();
+
+    static {
+        NAMED.put(SftpSubsystem.SSH_FXP_OPEN, "OPEN");
+        NAMED.put(SftpSubsystem.SSH_FXP_LSTAT, "LSTAT");
+        NAMED.put(SftpSubsystem.SSH_FXP_SETSTAT, "SETSTAT");
+        NAMED.put(SftpSubsystem.SSH_FXP_OPENDIR, "OPENDIR");
+        NAMED.put(SftpSubsystem.SSH_FXP_REMOVE, "REMOVE");
+        NAMED.put(SftpSubsystem.SSH_FXP_MKDIR, "MKDIR");
+        NAMED.put(SftpSubsystem.SSH_FXP_RMDIR, "RMDIR");
+        NAMED.put(SftpSubsystem.SSH_FXP_STAT, "STAT");
+        NAMED.put(SftpSubsystem.SSH_FXP_RENAME, "RENAME");
+    }
+
     private final SshServer server;
 
     private final Path root;
@@ -141,6 +156,10 @@ final class SftpTestServer implements Closeable {
     private volatile boolean linkAsNoSuchFile;
 
     private final AtomicInteger linkRequests = new AtomicInteger();
+
+    // The requests by name that the server got, in order: the packet type and the first path, for example
+    // "STAT data/f.txt", and "LINK" with the new path for a hard link. A test counts the looks of one name with it.
+    private final List<String> named = new CopyOnWriteArrayList<>();
 
     SftpTestServer() throws IOException {
         this(0);
@@ -226,6 +245,7 @@ final class SftpTestServer implements Closeable {
                     protected void process(final Buffer buffer) throws IOException {
                         // The buffer starts with the length of the packet, then its type.
                         hold(buffer.array()[buffer.rpos() + 4] & 0xff);
+                        note(buffer);
                         if (startFolder == null || !failedLook(buffer) && !hardLink(buffer)) {
                             super.process(buffer);
                         }
@@ -239,6 +259,18 @@ final class SftpTestServer implements Closeable {
                             buffer.putString("1");
                         }
                         super.send(buffer);
+                    }
+
+                    private void note(final Buffer buffer) {
+                        final int start = buffer.rpos();
+                        buffer.getInt();
+                        final int type = buffer.getByte() & 0xff;
+                        final String name = NAMED.get(type);
+                        if (name != null) {
+                            buffer.getInt();
+                            named.add(name + " " + buffer.getString());
+                        }
+                        buffer.rpos(start);
                     }
 
                     // A stat or an lstat that the server answers with a failure, as FileZilla Server does for a
@@ -278,6 +310,7 @@ final class SftpTestServer implements Closeable {
                         final String from = buffer.getString();
                         final String to = buffer.getString();
                         linkRequests.incrementAndGet();
+                        named.add("LINK " + to);
                         if (linkAsNoSuchFile) {
                             sendStatus(id, SSH_FX_NO_SUCH_FILE, from);
                             return true;
@@ -654,6 +687,15 @@ final class SftpTestServer implements Closeable {
     // A server with a start folder answers each hard link with no such file, also when the old path is there.
     void answerNoSuchFileForLinks(final boolean noSuchFile) {
         linkAsNoSuchFile = noSuchFile;
+    }
+
+    // The requests by name since the start or the last clear, in order.
+    List<String> named() {
+        return new ArrayList<>(named);
+    }
+
+    void clearNamed() {
+        named.clear();
     }
 
     int linkRequests() {
