@@ -29,6 +29,7 @@ import java.lang.reflect.Proxy;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.FileTime;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -923,6 +924,50 @@ class FailStateStoreTest {
         assertEquals(reads, controlled.reads);
         assertEquals(writes, controlled.stores);
         released(held);
+    }
+
+    // An unclear commit leaves the source in place. With no hash from the read, the source is hashed again through
+    // its own connection, and the hash counts only while the source has the size and the time of the take.
+    @Test
+    void anUnclearCommitWithNoHashHashesTheSourceAgain() throws Exception {
+        FailState current = startFailure();
+        FileIdentity noDigest = new FileIdentity(uri, current.identity.size, current.identity.mtime,
+                current.identity.mtimeSource, null);
+        Path target = dir.resolve("target");
+        Files.write(target, Files.readAllBytes(data));
+        Files.setLastModifiedTime(target, FileTime.fromMillis(current.identity.mtime + 60000));
+        String targetUri = target.toUri().toString();
+        assertEquals(FailStateStore.Match.MATCH, store.compareTarget(io, io, noDigest, targetUri).match);
+        assertEquals(FailStateStore.Match.DIFFERENT, store.compareTarget(io, noDigest, targetUri).match);
+
+        byte[] other = Files.readAllBytes(data);
+        other[0]++;
+        Files.write(target, other);
+        assertEquals(FailStateStore.Match.DIFFERENT, store.compareTarget(io, io, noDigest, targetUri).match);
+
+        // The source changed after the take: a new time, or a new size. Its hash does not count.
+        Files.write(target, Files.readAllBytes(data));
+        FileTime taken = Files.getLastModifiedTime(data);
+        Files.setLastModifiedTime(data, FileTime.fromMillis(current.identity.mtime + 120000));
+        assertEquals(FailStateStore.Match.DIFFERENT, store.compareTarget(io, io, noDigest, targetUri).match);
+        Files.setLastModifiedTime(data, taken);
+        assertEquals(FailStateStore.Match.MATCH, store.compareTarget(io, io, noDigest, targetUri).match);
+        Files.write(data, new byte[1025]);
+        Files.setLastModifiedTime(data, taken);
+        assertEquals(FailStateStore.Match.DIFFERENT, store.compareTarget(io, io, noDigest, targetUri).match);
+    }
+
+    // An unclear rename has moved the source away, so nothing is hashed again. The target is inferred from its size
+    // and time as before.
+    @Test
+    void anUnclearRenameWithNoHashIsStillInferred() throws Exception {
+        FailState current = startFailure();
+        FileIdentity noDigest = new FileIdentity(uri, current.identity.size, current.identity.mtime,
+                current.identity.mtimeSource, null);
+        Path target = dir.resolve("target");
+        Files.move(data, target);
+        assertEquals(FailStateStore.Match.MATCH_INFERRED,
+                store.compareTarget(io, io, noDigest, target.toUri().toString()).match);
     }
 
     @Test

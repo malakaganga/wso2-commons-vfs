@@ -880,6 +880,23 @@ public final class FailStateStore {
     }
 
     public Comparison compareTarget(LockIo io, FileIdentity id, String targetUri) throws IOException {
+        return compareTarget(io, null, id, targetUri);
+    }
+
+    /**
+     * Compares the target of a move that ended unclear with the file the flow took. With no hash in the identity, a
+     * source that the step left in place, as a commit does, is hashed again through its own connection. That hash
+     * counts only when the source still has the size and the time of the take. Else the target is compared by size
+     * and time alone, which never gives a match.
+     *
+     * @param io the connection of the target.
+     * @param source the connection of the source, or null to compare a target with no hash by size and time alone.
+     * @param id the identity of the take.
+     * @param targetUri the target.
+     * @return the comparison.
+     * @throws IOException for a failure of the target that is not a transport error.
+     */
+    public Comparison compareTarget(LockIo io, LockIo source, FileIdentity id, String targetUri) throws IOException {
         try {
             StatNow stat = stat(io, targetUri);
             if (!stat.isThere()) {
@@ -889,7 +906,8 @@ public final class FailStateStore {
             if (id.size != target.size) {
                 return new Comparison(Match.DIFFERENT, null);
             }
-            if (id.digest() == null) {
+            String expected = id.digest() != null ? id.digest() : source == null ? null : sourceDigest(source, id);
+            if (expected == null) {
                 return new Comparison(id.readable() && id.mtime == target.mtime && id.mtimeSource == target.mtimeSource
                         ? Match.MATCH_INFERRED : Match.DIFFERENT, null);
             }
@@ -897,7 +915,7 @@ public final class FailStateStore {
             if (bytes.kind == DigestResult.Kind.GONE) {
                 return new Comparison(Match.ABSENT, null);
             }
-            return new Comparison(id.size == bytes.count && id.digest().equals(bytes.digest)
+            return new Comparison(id.size == bytes.count && expected.equals(bytes.digest)
                     ? Match.MATCH : Match.DIFFERENT, null);
         } catch (Failure failure) {
             if (failure.transport()) {
@@ -907,6 +925,25 @@ public final class FailStateStore {
         }
     }
 
+
+    // The hash of a source that still has the size and the time of the take, or null. A source that is gone, that
+    // changed or that can not be read leaves the comparison to size and time.
+    private String sourceDigest(LockIo source, FileIdentity id) {
+        try {
+            StatNow now = stat(source, id.uri);
+            if (!now.isThere() || !id.readable()) {
+                return null;
+            }
+            FileIdentity found = FileIdentity.from(id.uri, now);
+            if (found.size != id.size || found.mtime != id.mtime || found.mtimeSource != id.mtimeSource) {
+                return null;
+            }
+            DigestResult bytes = digest(source, id.uri);
+            return bytes.kind == DigestResult.Kind.DONE && bytes.count == id.size ? bytes.digest : null;
+        } catch (Failure failure) {
+            return null;
+        }
+    }
 
     private FailState next(FileIdentity original, FailState old, FailState.Outcome outcome,
             FailState.Action failed, String failedTarget, ActionResult action) {
