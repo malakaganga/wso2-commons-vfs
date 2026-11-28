@@ -39,6 +39,7 @@ import org.junit.jupiter.api.io.TempDir;
 import org.wso2.org.apache.commons.vfs2.FileObject;
 import org.wso2.org.apache.commons.vfs2.FileSystemException;
 import org.wso2.org.apache.commons.vfs2.FileType;
+import org.wso2.org.apache.commons.vfs2.cache.LRUFilesCache;
 import org.wso2.org.apache.commons.vfs2.cache.NullFilesCache;
 import org.wso2.org.apache.commons.vfs2.impl.StandardFileSystemManager;
 import org.wso2.org.apache.commons.vfs2.provider.AtomicOps;
@@ -115,6 +116,20 @@ public class FtpKnownFolderWriteTest {
         AtomicOps.of(lock).writeInKnownFolder(LOCK);
         assertFalse(since(mark).contains(FOLDER_ABOVE), String.valueOf(since(mark)));
         assertArrayEquals(LOCK, onServer("k.lock"));
+    }
+
+    // With a files cache the parent object could keep a folder entry, so the write is the plain write.
+    @Test
+    public void withAFilesCacheTheKnownFolderWriteIsThePlainWrite() throws Exception {
+        manager.close();
+        manager = new StandardFileSystemManager();
+        manager.setFilesCache(new LRUFilesCache(1000));
+        manager.init();
+        final FileObject lock = lock("c.lock");
+        final int mark = server.trace().size();
+        AtomicOps.of(lock).writeInKnownFolder(LOCK);
+        assertTrue(since(mark).contains(FOLDER_ABOVE), String.valueOf(since(mark)));
+        assertArrayEquals(LOCK, onServer("c.lock"));
     }
 
     @Test

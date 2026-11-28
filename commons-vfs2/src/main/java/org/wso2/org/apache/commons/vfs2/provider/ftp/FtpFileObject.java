@@ -50,6 +50,7 @@ import org.wso2.org.apache.commons.vfs2.FileSystemException;
 import org.wso2.org.apache.commons.vfs2.FileType;
 import org.wso2.org.apache.commons.vfs2.NameScope;
 import org.wso2.org.apache.commons.vfs2.RandomAccessContent;
+import org.wso2.org.apache.commons.vfs2.cache.NullFilesCache;
 import org.wso2.org.apache.commons.vfs2.provider.AbstractFileName;
 import org.wso2.org.apache.commons.vfs2.provider.AbstractFileObject;
 import org.wso2.org.apache.commons.vfs2.provider.AtomicCapabilities;
@@ -709,6 +710,11 @@ public class FtpFileObject extends AbstractFileObject<FtpFileSystem> implements 
                 }
                 return linkDest.getChildren();
             }
+        }
+        // With a files cache the children of a cached folder share its listing already, and a child that the cache
+        // keeps could keep an entry past the close of its folder. So they keep the look of today.
+        if (!withoutFilesCache()) {
+            return null;
         }
         // A folder that can not be entered can not be listed.
         if (!doGetChildren()) {
@@ -1637,10 +1643,12 @@ public class FtpFileObject extends AbstractFileObject<FtpFileSystem> implements 
     }
 
     // The parent object takes a folder entry, as the root does, so the plain write sends no listing of the folder
-    // above. The look at this name before the STOR and the listing after it stay.
+    // above. The look at this name before the STOR and the listing after it stay. With a files cache the write is the
+    // plain write, since the cache could keep the entry.
     @Override
     public void writeInKnownFolder(final byte[] content) throws IOException {
-        final FtpFileObject parent = (FtpFileObject) FileObjectUtils.getAbstractFileObject(getParent());
+        final FtpFileObject parent = withoutFilesCache()
+                ? (FtpFileObject) FileObjectUtils.getAbstractFileObject(getParent()) : null;
         if (parent != null) {
             final FTPFile folder = new FTPFile();
             folder.setType(FTPFile.DIRECTORY_TYPE);
@@ -1662,6 +1670,12 @@ public class FtpFileObject extends AbstractFileObject<FtpFileSystem> implements 
                 inRefresh.set(false);
             }
         }
+    }
+
+    // With no files cache each resolve makes a new object, so an entry that an object takes lives only as long as the
+    // step that resolved it.
+    private boolean withoutFilesCache() {
+        return getFileSystem().getFileSystemManager().getFilesCache() instanceof NullFilesCache;
     }
 
     // Takes an entry for this name while none is known. The next look at this name then needs no listing of its

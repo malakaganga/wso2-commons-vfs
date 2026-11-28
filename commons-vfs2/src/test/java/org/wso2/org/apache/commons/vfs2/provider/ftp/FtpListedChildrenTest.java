@@ -32,6 +32,7 @@ import org.junit.jupiter.api.io.TempDir;
 import org.wso2.org.apache.commons.vfs2.FileObject;
 import org.wso2.org.apache.commons.vfs2.FileSystemException;
 import org.wso2.org.apache.commons.vfs2.FileType;
+import org.wso2.org.apache.commons.vfs2.cache.LRUFilesCache;
 import org.wso2.org.apache.commons.vfs2.cache.NullFilesCache;
 import org.wso2.org.apache.commons.vfs2.impl.StandardFileSystemManager;
 
@@ -99,6 +100,23 @@ public class FtpListedChildrenTest {
         }
         assertEquals(1, listings(mark).size(), String.valueOf(listings(mark)));
         assertEquals("LIST -a in", listings(mark).get(0));
+    }
+
+    // With a files cache a child that the cache keeps takes no entry. A child that nobody asked before the close of
+    // its folder lists the folder anew, as before.
+    @Test
+    public void withAFilesCacheAChildAfterTheCloseOfItsFolderListsAnew() throws Exception {
+        manager.close();
+        manager = new StandardFileSystemManager();
+        manager.setFilesCache(new LRUFilesCache(1000));
+        manager.init();
+        final FileObject folder = resolve("/in");
+        final FileObject[] children = folder.getChildren();
+        assertEquals(FileType.FILE, children[0].getType());
+        folder.close();
+        final int mark = server.trace().size();
+        assertEquals(FileType.FILE, children[1].getType());
+        assertEquals(1, listings(mark).size(), String.valueOf(listings(mark)));
     }
 
     @Test
