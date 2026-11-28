@@ -26,6 +26,7 @@ import org.wso2.org.apache.commons.vfs2.FileSystem;
 import org.wso2.org.apache.commons.vfs2.FileSystemException;
 import org.wso2.org.apache.commons.vfs2.FileSystemManager;
 import org.wso2.org.apache.commons.vfs2.FileSystemOptions;
+import org.wso2.org.apache.commons.vfs2.cache.NullFilesCache;
 import org.wso2.org.apache.commons.vfs2.provider.AtomicCapabilities.Answer;
 import org.wso2.org.apache.commons.vfs2.provider.AtomicOps;
 import org.wso2.org.apache.commons.vfs2.provider.AtomicOutcome;
@@ -51,23 +52,54 @@ public class LockIo {
      * manager does. That probe checks the connection and builds it again when it was dropped. Its later resolves use
      * the file system of the first one with no probe, so each name of the step is asked once. A view is a local value
      * of one step. It is never kept, so the next step starts with a probe again.
+     * <p>
+     * With no files cache the probe asked the server whether the first name is there. The first look of that name in
+     * the view takes this answer and asks nothing.
+     * </p>
      */
     public LockIo view() {
         final LockIo probing = this;
         return new LockIo(manager, options) {
             private FileSystem system;
 
+            private String first;
+
+            private Boolean there;
+
             @Override
             public FileObject resolve(final String uri) throws FileSystemException {
                 if (system == null) {
                     final FileObject file = probing.resolve(uri);
                     system = file.getFileSystem();
+                    if (manager.getFilesCache() instanceof NullFilesCache) {
+                        first = uri;
+                        there = file.exists();
+                    }
                     return file;
                 }
                 final FileName name = system.getFileSystemManager().resolveURI(uri);
                 // A name of another root belongs to another file system and gets a probed resolve of its own.
                 return name.getRootURI().equals(system.getRootName().getRootURI()) ? system.resolveFile(name)
                         : probing.resolve(uri);
+            }
+
+            // The answer of the probe serves one look of the first name.
+            @Override
+            boolean exists(final String uri) throws IOException {
+                if (there != null && uri.equals(first)) {
+                    final boolean known = there;
+                    there = null;
+                    return known;
+                }
+                return super.exists(uri);
+            }
+
+            @Override
+            boolean existsAsked(final String uri) throws IOException {
+                if (uri.equals(first)) {
+                    there = null;
+                }
+                return super.exists(uri);
             }
         };
     }
@@ -85,6 +117,11 @@ public class LockIo {
         try (FileObject file = resolve(uri)) {
             return AtomicOps.existsNow(file);
         }
+    }
+
+    // A look that asks the server, also when a view knows the answer of its probe.
+    boolean existsAsked(final String uri) throws IOException {
+        return exists(uri);
     }
 
     LockValue read(final String uri) throws IOException {

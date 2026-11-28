@@ -358,8 +358,8 @@ public final class ShareLock {
         try {
             // The take asks the server through one view from the look of the capability to the create. The first
             // resolve probes the data name, which shares its folder and so its capability with the lock name. The
-            // check, the look of the data name and the create follow with no probe. The write, the read backs and
-            // the later steps of the lock resolve as before.
+            // check, the look of the data name and the create follow with no probe. The look of the data name takes
+            // the answer of that probe. The write, the read backs and the later steps of the lock resolve as before.
             final LockIo view = io.view();
             final Answer exclusive = call(CallType.READ, () -> view.exclusive(handle.uri));
             if (capabilityLogged.compareAndSet(false, true) && exclusive == Answer.NO) {
@@ -375,7 +375,7 @@ public final class ShareLock {
             }
             final boolean listed = exclusive == Answer.NO && !handle.takenOver && handle.listing != null
                     && handle.listing.lists(handle.uri);
-            if (mode == Mode.LISTENER && !listed && !exists(view, handle.uri)) {
+            if (mode == Mode.LISTENER && !listed && !dataThere(view, handle)) {
                 return LockOutcome.of(FILE_GONE);
             }
             hold("sharelock.after-look", LockIo.pointKey(handle.uri));
@@ -416,6 +416,12 @@ public final class ShareLock {
         } catch (final Failure error) {
             return error.outcome(ERROR);
         }
+    }
+
+    // The look of the data name takes the answer of the probe of the view. A take over inside the check is later than
+    // that probe, so after it the server is asked.
+    private boolean dataThere(final LockIo view, final HeldLock handle) throws Failure {
+        return call(CallType.READ, () -> handle.takenOver ? view.existsAsked(handle.uri) : view.exists(handle.uri));
     }
 
     private LockOutcome lostReply(final AtomicResult reply, final long start, final LockOutcome.Kind kind) {

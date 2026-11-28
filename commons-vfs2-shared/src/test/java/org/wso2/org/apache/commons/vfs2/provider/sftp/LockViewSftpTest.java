@@ -24,6 +24,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.wso2.vfs.shared.lock.LockOutcome.Kind.ACQUIRED;
 import static org.wso2.vfs.shared.lock.LockOutcome.Kind.BUSY_SHARE;
+import static org.wso2.vfs.shared.lock.LockOutcome.Kind.FILE_GONE;
 
 import java.nio.file.Files;
 import java.util.ArrayList;
@@ -101,6 +102,44 @@ class LockViewSftpTest {
         final int link = named.indexOf("LINK /data/f.txt.lock");
         assertTrue(link > 0, named.toString());
         assertEquals(1, looks(named.subList(0, link), "/data/f.txt.lock"), named.toString());
+    }
+
+    // The look of the data name in the listener take takes the answer of the probe of the view. The data name is
+    // asked once in the whole take.
+    @Test
+    void aTakeAsksTheDataNameOnce() throws Exception {
+        server.write("data/f.txt", "f");
+        final LockIo io = new LockIo(manager, options);
+        server.clearNamed();
+        assertEquals(ACQUIRED, locks.acquire(io, server.uri("data/f.txt"), ShareLock.Mode.LISTENER, null).kind);
+        final List<String> named = server.named();
+        assertEquals(1, looks(named, "/data/f.txt"), named.toString());
+    }
+
+    // A take over inside the check comes after the probe, so the look of the data name asks the server again.
+    @Test
+    void aTakeOverAsksTheDataNameAgain() throws Exception {
+        server.write("data/f.txt", "f");
+        server.write("data/f.txt.lock", "1:foreign:127.0.0.1:1:v2:" + UUID.randomUUID());
+        final LockIo io = new LockIo(manager, options);
+        server.clearNamed();
+        final LockOutcome taken = locks.acquire(io, server.uri("data/f.txt"), ShareLock.Mode.LISTENER, null);
+        assertEquals(ACQUIRED, taken.kind);
+        assertTrue(taken.handle.tookOver());
+        final List<String> named = server.named();
+        assertEquals(2, looks(named, "/data/f.txt"), named.toString());
+    }
+
+    // A file that is gone before the take is gone by the answer of the probe. No lock is made.
+    @Test
+    void aFileGoneBeforeTheTakeIsGone() throws Exception {
+        Files.createDirectories(server.getRoot().resolve("data"));
+        final LockIo io = new LockIo(manager, options);
+        server.clearNamed();
+        assertEquals(FILE_GONE, locks.acquire(io, server.uri("data/f.txt"), ShareLock.Mode.LISTENER, null).kind);
+        assertFalse(Files.exists(server.getRoot().resolve("data/f.txt.lock")));
+        final List<String> named = server.named();
+        assertEquals(1, looks(named, "/data/f.txt"), named.toString());
     }
 
     // The fail store looks at the marker of the file once. The stat of the file before it probes the connection.
