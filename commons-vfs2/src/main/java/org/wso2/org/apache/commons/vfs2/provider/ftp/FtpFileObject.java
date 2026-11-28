@@ -710,7 +710,21 @@ public class FtpFileObject extends AbstractFileObject<FtpFileSystem> implements 
                 return linkDest.getChildren();
             }
         }
-        return null;
+        // A folder that can not be entered can not be listed.
+        if (!doGetChildren()) {
+            throw new FileSystemException("vfs.provider.ftp/list-not-entered.error", getName());
+        }
+        // Each child takes its entry from this one listing, so its type needs no listing of this folder again. A link
+        // and a name that the child would not find again in the listing keep the look of today.
+        final List<FileObject> children = new ArrayList<>(childMap.size());
+        for (final FTPFile entry : childMap.values()) {
+            final FileObject child = resolveFile("./" + encodeServerPath(entry.getName()), NameScope.CHILD);
+            if (!entry.isSymbolicLink() && entry.getName().equals(UriParser.decode(child.getName().getBaseName()))) {
+                ftpOf(child).takeEntry(entry);
+            }
+            children.add(child);
+        }
+        return children.toArray(FileObject.EMPTY_ARRAY);
     }
 
     /**
@@ -1633,6 +1647,17 @@ public class FtpFileObject extends AbstractFileObject<FtpFileSystem> implements 
                 }
             } finally {
                 inRefresh.set(false);
+            }
+        }
+    }
+
+    // Takes an entry for this name while none is known. The next look at this name then needs no listing of its
+    // parent folder.
+    private void takeEntry(final FTPFile entry) {
+        synchronized (getFileSystem()) {
+            if (ftpFile == null) {
+                ftpFile = entry;
+                refreshParent = false;
             }
         }
     }

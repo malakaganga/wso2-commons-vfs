@@ -32,12 +32,14 @@ import java.util.concurrent.atomic.AtomicInteger;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLSocketFactory;
 
+import org.apache.commons.net.ftp.FTPReply;
 import org.apache.ftpserver.DataConnectionConfigurationFactory;
 import org.apache.ftpserver.FtpServer;
 import org.apache.ftpserver.FtpServerFactory;
 import org.apache.ftpserver.ftplet.Authentication;
 import org.apache.ftpserver.ftplet.AuthenticationFailedException;
 import org.apache.ftpserver.ftplet.Authority;
+import org.apache.ftpserver.ftplet.DataConnectionFactory;
 import org.apache.ftpserver.ftplet.DefaultFtpReply;
 import org.apache.ftpserver.ftplet.DefaultFtplet;
 import org.apache.ftpserver.ftplet.FtpException;
@@ -94,16 +96,23 @@ public final class ScriptedFtpServer implements AutoCloseable {
         final String text;
         final long delayMillis;
         final boolean drop;
+        final String listing;
         final AtomicInteger left;
 
         Rule(final String command, final String argument, final int code, final String text, final long delayMillis,
                 final boolean drop, final int times) {
+            this(command, argument, code, text, delayMillis, drop, null, times);
+        }
+
+        Rule(final String command, final String argument, final int code, final String text, final long delayMillis,
+                final boolean drop, final String listing, final int times) {
             this.command = command;
             this.argument = argument;
             this.code = code;
             this.text = text;
             this.delayMillis = delayMillis;
             this.drop = drop;
+            this.listing = listing;
             this.left = new AtomicInteger(times);
         }
 
@@ -270,6 +279,21 @@ public final class ScriptedFtpServer implements AutoCloseable {
     }
 
     /**
+     * Answers a listing whose argument holds the text with the given lines in place of the server, a number of times.
+     * The lines go on the data connection as the server would send them, so a test can show entries that the
+     * server never lists, such as a symbolic link.
+     *
+     * @param argument a text that the argument holds.
+     * @param times how many times.
+     * @param lines the lines of the listing.
+     * @return this server.
+     */
+    public ScriptedFtpServer listing(final String argument, final int times, final String... lines) {
+        rules.add(new Rule("LIST", argument, 0, null, 0, false, String.join("\r\n", lines) + "\r\n", times));
+        return this;
+    }
+
+    /**
      * Gets the commands that came, as "session command argument".
      *
      * @return a copy.
@@ -341,6 +365,10 @@ public final class ScriptedFtpServer implements AutoCloseable {
                     if (rule.drop) {
                         return FtpletResult.DISCONNECT;
                     }
+                    if (rule.listing != null) {
+                        sendListing(session, rule.listing);
+                        return FtpletResult.SKIP;
+                    }
                     if (rule.code > 0) {
                         session.write(new DefaultFtpReply(rule.code, rule.text));
                         return FtpletResult.SKIP;
@@ -349,6 +377,22 @@ public final class ScriptedFtpServer implements AutoCloseable {
                 }
             }
             return super.beforeCommand(session, request);
+        }
+
+        // Sends the lines on the data connection that the client opened with its last PASV, then ends the transfer.
+        private void sendListing(final FtpSession session, final String listing) throws FtpException, IOException {
+            session.write(new DefaultFtpReply(FTPReply.FILE_STATUS_OK, "Scripted listing"));
+            final DataConnectionFactory data = session.getDataConnection();
+            try {
+                data.openConnection().transferToClient(session, listing);
+            } catch (final IOException e) {
+                throw e;
+            } catch (final Exception e) {
+                throw new IOException(e);
+            } finally {
+                data.closeDataConnection();
+            }
+            session.write(new DefaultFtpReply(FTPReply.CLOSING_DATA_CONNECTION, "Scripted listing sent"));
         }
     }
 
